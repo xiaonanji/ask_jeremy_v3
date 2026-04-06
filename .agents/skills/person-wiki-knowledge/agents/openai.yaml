@@ -1,0 +1,4 @@
+interface:
+  display_name: "Person Wiki"
+  short_description: "Use the person-wiki repo as a searchable knowledge base."
+  default_prompt: "Use $person-wiki-knowledge to answer from my person-wiki repository."

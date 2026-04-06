@@ -14,6 +14,7 @@ from langchain_core.messages import AnyMessage, BaseMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.runtime import Runtime
 
 from .config import Settings
@@ -23,6 +24,7 @@ from .skills.catalog import SkillCatalog
 from .skills.discovery import SkillDiscoveryService
 from .skills.parser import SkillParser
 from .skills.prompting import SkillPromptRenderer
+from .tools import LocalToolRegistry
 
 
 @dataclass
@@ -36,6 +38,8 @@ class SessionContext:
 class GraphContext:
     session_id: str
     workspace_path: str
+    project_root: str
+    person_wiki_root: str | None
     model_provider: str
     model_name: str
     system_prompt: str
@@ -77,6 +81,7 @@ class LangGraphChatClient:
             max_auto_activated_skills=settings.max_auto_activated_skills,
         )
         self.skill_prompt_renderer = SkillPromptRenderer()
+        self._tools = LocalToolRegistry(settings).build()
         self._graph = self._build_graph()
 
     def generate_reply(
@@ -106,9 +111,11 @@ class LangGraphChatClient:
         builder = StateGraph(SkillAwareState, context_schema=GraphContext)
         builder.add_node("select_skills", self._select_skills)
         builder.add_node("call_model", self._call_model)
+        builder.add_node("tools", ToolNode(self._tools))
         builder.add_edge(START, "select_skills")
         builder.add_edge("select_skills", "call_model")
-        builder.add_edge("call_model", END)
+        builder.add_conditional_edges("call_model", tools_condition)
+        builder.add_edge("tools", "call_model")
         return builder.compile(checkpointer=self._checkpointer)
 
     def list_skills(self) -> list[SkillSummary]:
@@ -223,13 +230,15 @@ class LangGraphChatClient:
                     f"Current date: {context.current_date}\n"
                     f"Current timezone: {context.current_timezone}\n"
                     f"Conversation session id: {context.session_id}\n"
-                    f"Session workspace: {context.workspace_path}"
+                    f"Session workspace: {context.workspace_path}\n"
+                    f"Project root: {context.project_root}\n"
+                    f"Configured PERSON_WIKI_ROOT: {context.person_wiki_root or 'not configured'}"
                 )
             ),
             *self._skill_prompt_messages(state),
             *messages,
         ]
-        response = self._get_model(context).invoke(prompt)
+        response = self._get_model(context).bind_tools(self._tools).invoke(prompt)
         if not isinstance(response, AIMessage):
             response = AIMessage(content=str(response))
         if not response.id:
@@ -274,6 +283,12 @@ class LangGraphChatClient:
         return GraphContext(
             session_id=session.session_id,
             workspace_path=str(session.workspace_path),
+            project_root=str(self.settings.project_root),
+            person_wiki_root=(
+                str(self.settings.person_wiki_root)
+                if self.settings.person_wiki_root is not None
+                else None
+            ),
             model_provider=session.model.model_provider,
             model_name=session.model.model_name,
             system_prompt=self.settings.system_prompt,

@@ -7,6 +7,7 @@ FastAPI backend for the first slice of the Ask Jeremy project.
 - Session-scoped chat API
 - Filesystem workspace for every conversation
 - LangGraph v1 chat workflow with SQLite-backed checkpointing per session
+- Local tool calling for shell commands and inline Python execution
 - OpenAI and Anthropic models through LangChain chat model adapters
 - Skill discovery from project and user skill roots
 - Skill catalog endpoint plus per-session LLM-driven skill activation
@@ -40,6 +41,19 @@ Relevant settings:
 - `ENABLE_USER_SKILLS`
 - `TRUST_PROJECT_SKILLS`
 - `MAX_AUTO_ACTIVATED_SKILLS`
+- `PERSON_WIKI_ROOT`
+- `TOOL_TIMEOUT_SECONDS`
+
+## Local Tools
+
+The chat agent can call two local tools during a turn:
+
+- `run_shell_command`: runs local shell commands from the backend host
+- `run_python_script`: runs inline Python using the backend virtualenv interpreter
+
+These tools are not sandboxed. They should only be enabled in a trusted local environment.
+
+If you want the agent to search a personal wiki repository reliably, set `PERSON_WIKI_ROOT` in `backend/.env`.
 
 ## Skill APIs
 
