@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
 import json
 import sqlite3
 from typing import Annotated, TypedDict
@@ -10,7 +12,7 @@ from uuid import uuid4
 
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.messages import AnyMessage, BaseMessage
+from langchain_core.messages import AIMessageChunk, AnyMessage, BaseMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -18,7 +20,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.runtime import Runtime
 
 from .config import Settings
-from .schemas import ChatMessage, SessionModelConfig, SkillSummary
+from .schemas import ChatMessage, DatabaseBackend, SessionModelConfig, SkillSummary
 from .skills.activation import SkillActivationManager
 from .skills.catalog import SkillCatalog
 from .skills.discovery import SkillDiscoveryService
@@ -31,6 +33,8 @@ from .tools import LocalToolRegistry
 class SessionContext:
     session_id: str
     workspace_path: Path
+    artifacts_path: Path
+    database_backend: DatabaseBackend
     model: SessionModelConfig
 
 
@@ -38,6 +42,8 @@ class SessionContext:
 class GraphContext:
     session_id: str
     workspace_path: str
+    artifacts_path: str
+    database_backend: DatabaseBackend
     project_root: str
     person_wiki_root: str | None
     model_provider: str
@@ -82,7 +88,7 @@ class LangGraphChatClient:
         )
         self.skill_prompt_renderer = SkillPromptRenderer()
         self._tools = LocalToolRegistry(settings).build()
-        self._graph = self._build_graph()
+        self._graph = self._build_graph(streaming=False)
 
     def generate_reply(
         self,
@@ -107,7 +113,102 @@ class LangGraphChatClient:
     def close(self) -> None:
         self._checkpoint_connection.close()
 
-    def _build_graph(self):
+    async def stream_reply(
+        self,
+        session: SessionContext,
+        history: list[ChatMessage],
+    ) -> AsyncIterator[dict[str, object]]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, object] | BaseException | object] = asyncio.Queue()
+        sentinel = object()
+        config = {"configurable": {"thread_id": session.session_id}}
+        history_messages = self._to_langchain_messages(history)
+        graph_context = self._graph_context(session)
+
+        def worker() -> None:
+            connection = sqlite3.connect(
+                self.settings.langgraph_checkpoint_path,
+                check_same_thread=False,
+            )
+            try:
+                checkpointer = SqliteSaver(connection)
+                stream_graph = self._build_graph(streaming=False, checkpointer=checkpointer)
+
+                for mode, data in stream_graph.stream(
+                    {"messages": history_messages},
+                    config,
+                    context=graph_context,
+                    stream_mode=["messages", "tasks"],
+                ):
+                    if mode == "messages":
+                        message, metadata = data
+                        if metadata.get("langgraph_node") != "call_model":
+                            continue
+                        if isinstance(message, AIMessageChunk):
+                            delta = str(message.text)
+                            if delta:
+                                loop.call_soon_threadsafe(
+                                    queue.put_nowait,
+                                    {
+                                        "type": "assistant_delta",
+                                        "delta": delta,
+                                    },
+                                )
+                        continue
+
+                    if mode == "tasks":
+                        if "triggers" in data:
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                {
+                                    "type": "task_started",
+                                    "task_id": data["id"],
+                                    "name": data["name"],
+                                },
+                            )
+                            continue
+
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            {
+                                "type": "task_finished",
+                                "task_id": data["id"],
+                                "name": data["name"],
+                                "error": data.get("error"),
+                            },
+                        )
+
+                final_reply = self._final_reply_for_session(
+                    session.session_id,
+                    graph=stream_graph,
+                )
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {
+                        "type": "final_response",
+                        "message_id": final_reply.message_id,
+                        "content": final_reply.content,
+                    },
+                )
+            except BaseException as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                connection.close()
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        worker_task = asyncio.create_task(asyncio.to_thread(worker))
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            await worker_task
+
+    def _build_graph(self, *, streaming: bool, checkpointer=None):
         builder = StateGraph(SkillAwareState, context_schema=GraphContext)
         builder.add_node("select_skills", self._select_skills)
         builder.add_node("call_model", self._call_model)
@@ -116,7 +217,7 @@ class LangGraphChatClient:
         builder.add_edge("select_skills", "call_model")
         builder.add_conditional_edges("call_model", tools_condition)
         builder.add_edge("tools", "call_model")
-        return builder.compile(checkpointer=self._checkpointer)
+        return builder.compile(checkpointer=checkpointer or self._checkpointer)
 
     def list_skills(self) -> list[SkillSummary]:
         return [self._to_skill_summary(skill) for skill in self.skill_catalog.list_skills()]
@@ -231,6 +332,8 @@ class LangGraphChatClient:
                     f"Current timezone: {context.current_timezone}\n"
                     f"Conversation session id: {context.session_id}\n"
                     f"Session workspace: {context.workspace_path}\n"
+                    f"Session artifacts: {context.artifacts_path}\n"
+                    f"Session database backend: {context.database_backend}\n"
                     f"Project root: {context.project_root}\n"
                     f"Configured PERSON_WIKI_ROOT: {context.person_wiki_root or 'not configured'}"
                 )
@@ -264,6 +367,7 @@ class LangGraphChatClient:
                 model_kwargs["base_url"] = context.base_url
             if context.max_tokens is not None:
                 model_kwargs["max_tokens"] = context.max_tokens
+            model_kwargs["streaming"] = True
             self._models[key] = init_chat_model(**model_kwargs)
         return self._models[key]
 
@@ -283,6 +387,8 @@ class LangGraphChatClient:
         return GraphContext(
             session_id=session.session_id,
             workspace_path=str(session.workspace_path),
+            artifacts_path=str(session.artifacts_path),
+            database_backend=session.database_backend,
             project_root=str(self.settings.project_root),
             person_wiki_root=(
                 str(self.settings.person_wiki_root)
@@ -345,6 +451,22 @@ class LangGraphChatClient:
         if isinstance(content, str):
             return content.strip()
         return str(content).strip()
+
+    def _final_reply_for_session(self, session_id: str, *, graph) -> GeneratedReply:
+        snapshot = graph.get_state({"configurable": {"thread_id": session_id}})
+        values = getattr(snapshot, "values", {}) or {}
+        messages = values.get("messages", [])
+        assistant_message = next(
+            (message for message in reversed(messages) if isinstance(message, AIMessage)),
+            None,
+        )
+        if assistant_message is None:
+            raise RuntimeError("No assistant message was produced for the streamed reply.")
+
+        return GeneratedReply(
+            message_id=assistant_message.id or str(uuid4()),
+            content=self._message_text(assistant_message),
+        )
 
     def _skill_prompt_messages(self, state: SkillAwareState) -> list[SystemMessage]:
         instructions = state.get("active_skill_instructions", [])

@@ -12,14 +12,31 @@ Do not guess today's date from model memory when the runtime context provides it
 
 Available tools:
 - `run_shell_command` runs local shell commands.
-- `run_python_script` runs inline Python with the backend interpreter.
+- `run_python_script` runs inline Python with the backend interpreter and reports generated session artifacts.
+- `execute_sql_query` runs read-only SQL against the current session database backend and saves results to the session artifacts folder.
 
 Tool use rules:
 - Use tools when the user asks you to inspect files, search repositories, query the personal wiki, or run local commands/scripts.
+- Use `execute_sql_query` for database retrieval when the task needs data from a configured database.
+- When generating charts or files with `run_python_script`, save them under the `SESSION_ARTIFACTS_PATH` environment variable so they can be surfaced later.
+- The active session decides whether SQL runs against SQLite or Snowflake.
+- Prefer targeted SELECT statements with explicit columns and filters, and avoid `SELECT *` unless it is genuinely needed.
+- `execute_sql_query` always returns JSON with an `exit_code`.
+- Treat `exit_code: 0` as success.
+- Treat `exit_code: 1` as an error and inspect `error_type`, `recoverable`, and `message`.
+- If `recoverable` is true and the error is a SQL syntax problem, amend the query and retry.
+- If `recoverable` is false, stop retrying and explain the blocking issue clearly to the user.
 - Prefer targeted read-only commands unless the user explicitly asks you to modify files or run a write action.
 - Never claim that you searched, inspected, or ran something unless you actually did it with a tool in the current turn.
 - Activated skills provide guidance on how to use tools, but you still need to call the tools yourself.
 - If a tool fails, say what failed and adjust instead of pretending the action succeeded.
+
+Data analysis behavior:
+- When the user asks for SQL results, a chart, a plot, a table, or any other data retrieval task, do not stop at extraction if the evidence supports interpretation.
+- By default, add concise observations, findings, patterns, anomalies, comparisons, or caveats that are grounded in the retrieved data or generated artifacts.
+- If you generate a chart or compute summary statistics, explain the most relevant takeaways instead of only saying that the artifact was created.
+- If the user explicitly asks for raw output only, no analysis, or just the data, then provide the requested output without extra interpretation.
+- Do not invent insights. Only state findings that are supported by executed queries, generated artifacts, or inspected results from the current session.
 
 For every user message, first judge whether the request is:
 - a simple single-step ask, or
@@ -63,6 +80,17 @@ class Settings(BaseSettings):
     max_auto_activated_skills: int = 3
     person_wiki_root: Path | None = None
     tool_timeout_seconds: int = 30
+    default_database_backend: str = "sqlite"
+    sqlite_database_path: Path | None = None
+    sql_query_max_rows: int = 1_000
+    sql_query_timeout_seconds: int = 30
+    snowflake_account: str | None = None
+    snowflake_user: str | None = None
+    snowflake_role: str | None = None
+    snowflake_warehouse: str | None = None
+    snowflake_database: str | None = None
+    snowflake_schema: str | None = None
+    snowflake_authenticator: str = "externalbrowser"
     default_model_provider: str = "openai"
     openai_api_key: str | None = None
     openai_base_url: str | None = None
@@ -89,6 +117,23 @@ class Settings(BaseSettings):
         if normalized not in {"openai", "anthropic"}:
             raise ValueError("DEFAULT_MODEL_PROVIDER must be either 'openai' or 'anthropic'")
         return normalized
+
+    @field_validator("default_database_backend")
+    @classmethod
+    def validate_database_backend(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"sqlite", "snowflake"}:
+            raise ValueError(
+                "DEFAULT_DATABASE_BACKEND must be either 'sqlite' or 'snowflake'"
+            )
+        return normalized
+
+    @field_validator("tool_timeout_seconds", "sql_query_max_rows", "sql_query_timeout_seconds")
+    @classmethod
+    def validate_positive_int(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("Timeouts and row limits must be at least 1.")
+        return value
 
     @property
     def cors_origins_list(self) -> list[str]:

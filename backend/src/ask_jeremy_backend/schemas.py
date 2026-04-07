@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 Role = Literal["system", "user", "assistant"]
 ModelProvider = Literal["openai", "anthropic"]
 SkillScope = Literal["project", "user"]
+DatabaseBackend = Literal["sqlite", "snowflake"]
 
 
 class ChatMessage(BaseModel):
@@ -15,6 +16,14 @@ class ChatMessage(BaseModel):
     role: Role
     content: str
     created_at: datetime
+    artifacts: list["ChatArtifact"] = Field(default_factory=list)
+
+
+class ChatArtifact(BaseModel):
+    filename: str
+    relative_path: str
+    mime_type: str | None = None
+    size_bytes: int
 
 
 class SessionMetadata(BaseModel):
@@ -25,6 +34,7 @@ class SessionMetadata(BaseModel):
     workspace_path: Path
     model_provider: ModelProvider
     model_name: str
+    database_backend: DatabaseBackend = "sqlite"
 
 
 class SessionSummary(BaseModel):
@@ -34,6 +44,7 @@ class SessionSummary(BaseModel):
     updated_at: datetime
     model_provider: ModelProvider
     model_name: str
+    database_backend: DatabaseBackend = "sqlite"
 
 
 class SessionDetail(BaseModel):
@@ -45,6 +56,7 @@ class CreateSessionRequest(BaseModel):
     title: str | None = None
     model_provider: ModelProvider | None = None
     model_name: str | None = None
+    database_backend: DatabaseBackend | None = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -77,6 +89,10 @@ class UpdateSessionRequest(BaseModel):
 class UpdateSessionModelRequest(BaseModel):
     model_provider: ModelProvider
     model_name: str = Field(min_length=1)
+
+
+class UpdateSessionDatabaseRequest(BaseModel):
+    database_backend: DatabaseBackend
 
 
 class ModelCatalogEntry(BaseModel):

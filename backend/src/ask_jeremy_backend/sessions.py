@@ -12,10 +12,12 @@ from uuid import uuid4
 from fastapi import HTTPException, status
 
 from .schemas import (
+    ChatArtifact,
     ChatMessage,
     SessionDetail,
     SessionLog,
     SessionLogTurn,
+    DatabaseBackend,
     SessionMetadata,
     SessionModelConfig,
     SessionSummary,
@@ -41,6 +43,7 @@ class SessionStore:
                     updated_at=metadata.updated_at,
                     model_provider=metadata.model_provider,
                     model_name=metadata.model_name,
+                    database_backend=metadata.database_backend,
                 )
             )
         return sorted(summaries, key=lambda item: item.updated_at, reverse=True)
@@ -48,6 +51,7 @@ class SessionStore:
     def create_session(
         self,
         model_config: SessionModelConfig,
+        database_backend: DatabaseBackend = "sqlite",
         title: str | None = None,
     ) -> SessionMetadata:
         with self._creation_lock:
@@ -68,6 +72,7 @@ class SessionStore:
                 workspace_path=workspace_dir,
                 model_provider=model_config.model_provider,
                 model_name=model_config.model_name,
+                database_backend=database_backend,
             )
 
             self._write_json(session_dir / "metadata.json", metadata.model_dump(mode="json"))
@@ -97,6 +102,7 @@ class SessionStore:
         role: str,
         content: str,
         message_id: str | None = None,
+        artifacts: list[ChatArtifact] | None = None,
     ) -> ChatMessage:
         session_dir = self._session_dir(session_id)
         with self._lock_for(session_id):
@@ -106,6 +112,7 @@ class SessionStore:
                 role=role,
                 content=content,
                 created_at=self._utc_now(),
+                artifacts=artifacts or [],
             )
             messages.append(message)
             self._write_json(
@@ -146,6 +153,22 @@ class SessionStore:
                 update={
                     "model_provider": model_config.model_provider,
                     "model_name": model_config.model_name,
+                    "updated_at": self._utc_now(),
+                }
+            )
+            self._write_json(session_dir / "metadata.json", metadata.model_dump(mode="json"))
+            return metadata
+
+    def update_session_database(
+        self,
+        session_id: str,
+        database_backend: DatabaseBackend,
+    ) -> SessionMetadata:
+        session_dir = self._session_dir(session_id)
+        with self._lock_for(session_id):
+            metadata = self._read_metadata(session_dir).model_copy(
+                update={
+                    "database_backend": database_backend,
                     "updated_at": self._utc_now(),
                 }
             )
