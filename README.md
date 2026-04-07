@@ -28,3 +28,20 @@ npm run dev
 ```
 
 The frontend expects the backend at `http://localhost:8000/api` by default.
+
+## Fresh Machine Setup
+
+On Windows, you can bootstrap both apps from the repo root with:
+
+```powershell
+.\setup-dev.ps1
+```
+
+The script:
+
+- creates `backend/.venv` if needed
+- installs backend dependencies with `pip install -e .`
+- creates `backend/.env` from `backend/.env.example` if it does not already exist
+- installs frontend dependencies with `npm ci`
+
+After the script finishes, set your API key in `backend/.env`, then start the backend and frontend in separate terminals.
