@@ -1,6 +1,6 @@
 ---
 name: person-wiki-knowledge
-description: Use this skill when the user wants to query, ingest, maintain, or reuse knowledge from the `person-wiki` repository. Use it for questions about what the wiki contains, how to search it, how to ingest new raw sources, how to refresh qmd search, or how to leverage this wiki from other projects. This skill is intended to work across agents that support `SKILL.md`-based skills and the `.agents/skills/` convention.
+description: Use this skill to search and reference the personal wiki knowledge base. Activate this skill proactively when you encounter undefined terms, need background context, or require additional information that might be documented in the wiki. Also use it when the user explicitly wants to query, ingest, maintain, or reuse knowledge from the `person-wiki` repository. The wiki contains accumulated knowledge across various topics and should be consulted whenever clarification or additional context would be helpful.
 ---
 
 # Person Wiki Knowledge
@@ -8,6 +8,12 @@ description: Use this skill when the user wants to query, ingest, maintain, or r
 ## Overview
 
 This skill teaches you how to use the `person-wiki` repository as a persistent knowledge base.
+
+**Proactive Usage**: Search the wiki proactively when:
+- The user mentions terms, concepts, or entities you're unfamiliar with
+- Additional context would improve your response quality
+- Background information might clarify ambiguous requirements
+- You need to verify facts or details that might be documented
 
 The repo contains:
 

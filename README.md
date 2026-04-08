@@ -23,6 +23,8 @@ uvicorn ask_jeremy_backend.main:app --reload
 
 ```bash
 cd frontend
+$env:Path = "C:\Users\sean.ji\node-v24.14.0-win-x64;" + $env:Path
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 npm install
 npm run dev
 ```

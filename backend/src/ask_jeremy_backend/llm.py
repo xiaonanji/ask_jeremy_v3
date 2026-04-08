@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import json
+import os
 import sqlite3
 from typing import Annotated, TypedDict
 from dataclasses import dataclass
@@ -74,6 +75,13 @@ class SkillAwareState(TypedDict, total=False):
 class LangGraphChatClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+        # Ensure .env takes precedence over system environment variables for Anthropic
+        # The Anthropic SDK reads ANTHROPIC_AUTH_TOKEN from os.environ directly,
+        # so we need to override it with the value from .env if present
+        if settings.anthropic_api_key:
+            os.environ['ANTHROPIC_AUTH_TOKEN'] = settings.anthropic_api_key
+
         self.settings.langgraph_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         self._checkpoint_connection = sqlite3.connect(
             self.settings.langgraph_checkpoint_path,
@@ -259,12 +267,23 @@ class LangGraphChatClient:
             return {}
 
         current_ids = list(state.get("active_skill_ids", []))
+
+        # Always include person-wiki-knowledge skill if available and PERSON_WIKI_ROOT is configured
+        always_active_skills = []
+        if context.person_wiki_root:
+            wiki_skill = self.skill_catalog.get_by_name("person-wiki-knowledge")
+            if wiki_skill and wiki_skill.id not in current_ids:
+                always_active_skills.append(wiki_skill.id)
+
         selected_ids = self._select_skill_ids_with_model(
             context=context,
             messages=messages,
             skills=available_skills,
             active_skill_ids=current_ids,
         )
+
+        # Merge always-active skills with LLM-selected skills
+        selected_ids = [*always_active_skills, *selected_ids]
         selected_ids = [skill_id for skill_id in selected_ids if skill_id not in current_ids]
         newly_selected = self.skill_activation.activate_by_ids(selected_ids)
         if not newly_selected and state.get("active_skill_instructions"):
@@ -450,6 +469,19 @@ class LangGraphChatClient:
         content = message.content
         if isinstance(content, str):
             return content.strip()
+
+        # Handle Anthropic-style content blocks: [{'text': '...', 'type': 'text'}]
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get('type') == 'text':
+                    text_parts.append(block.get('text', ''))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            if text_parts:
+                return '\n'.join(text_parts).strip()
+
+        # Fallback for any other format
         return str(content).strip()
 
     def _final_reply_for_session(self, session_id: str, *, graph) -> GeneratedReply:
