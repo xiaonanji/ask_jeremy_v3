@@ -763,6 +763,7 @@ textarea:focus-visible {
 .message-card {
   display: grid;
   gap: 0.5rem;
+  min-width: 0;
   padding: 1rem 1.05rem;
   border-radius: 1rem;
   background: var(--assistant);
@@ -793,6 +794,8 @@ textarea:focus-visible {
 .message-copy {
   color: #f5f9ff;
   line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 
 .message-copy.plain-text {
@@ -826,7 +829,9 @@ textarea:focus-visible {
 }
 
 .message-copy.markdown-content pre {
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-width: 100%;
   padding: 0.75rem 0.85rem;
   border-radius: 0.8rem;
   background: rgba(0, 0, 0, 0.28);
@@ -837,6 +842,8 @@ textarea:focus-visible {
   padding: 0;
   border-radius: 0;
   background: transparent;
+  white-space: pre;
+  word-wrap: normal;
 }
 
 .message-copy.markdown-content a {

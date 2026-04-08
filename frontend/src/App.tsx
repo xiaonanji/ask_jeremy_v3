@@ -465,10 +465,19 @@ export default function App() {
           }
 
           flushSync(() => {
-            setStreamTrace((current) => ({
-              liveDraft: `${current?.liveDraft ?? ""}${delta}`,
-              statusLines: current?.statusLines ?? []
-            }));
+            setStreamTrace((current) => {
+              const currentDraft = current?.liveDraft ?? "";
+              // Add newline after complete sentences that end with period, question mark, or colon
+              const needsNewline = currentDraft.length > 0 &&
+                                   /[.?:]$/.test(currentDraft.trimEnd()) &&
+                                   !currentDraft.endsWith('\n');
+              const separator = needsNewline ? '\n' : '';
+
+              return {
+                liveDraft: `${currentDraft}${separator}${delta}`,
+                statusLines: current?.statusLines ?? []
+              };
+            });
           });
           return;
         }
