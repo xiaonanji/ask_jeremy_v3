@@ -6,7 +6,7 @@ MCP servers are configured in backend/mcp.json:
       {
         "name":         "my-server",
         "url":          "http://192.168.1.100/mcp",
-        "bearer_token": "secret",
+        "bearer_token": "${MY_SECRET_TOKEN}",
         "enabled":      true
       }
     ]
@@ -17,6 +17,7 @@ lifetime. Restart the backend to pick up changes to mcp.json.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import warnings
 from contextlib import AsyncExitStack
@@ -66,7 +67,7 @@ def load_mcp_configs(config_path: Path) -> list[McpServerConfig]:
         configs.append(McpServerConfig(
             name=str(name),
             url=str(url),
-            bearer_token=str(item.get("bearer_token", "")),
+            bearer_token=os.path.expandvars(str(item.get("bearer_token", ""))),
             enabled=bool(item.get("enabled", True)),
         ))
     return [c for c in configs if c.enabled]
