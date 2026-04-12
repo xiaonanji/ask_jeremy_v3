@@ -27,6 +27,7 @@ from .skills.catalog import SkillCatalog
 from .skills.discovery import SkillDiscoveryService
 from .skills.parser import SkillParser
 from .skills.prompting import SkillPromptRenderer
+from .mcp_tools import set_mcp_event_emitter
 from .tools import LocalToolRegistry
 
 
@@ -95,7 +96,8 @@ class LangGraphChatClient:
             max_auto_activated_skills=settings.max_auto_activated_skills,
         )
         self.skill_prompt_renderer = SkillPromptRenderer()
-        self._tools = LocalToolRegistry(settings).build()
+        self._local_tools = LocalToolRegistry(settings).build()
+        self._tools = list(self._local_tools)
         self._graph = self._build_graph(streaming=False)
 
     def generate_reply(
@@ -134,6 +136,9 @@ class LangGraphChatClient:
         graph_context = self._graph_context(session)
 
         def worker() -> None:
+            set_mcp_event_emitter(
+                lambda event: loop.call_soon_threadsafe(queue.put_nowait, event)
+            )
             connection = sqlite3.connect(
                 self.settings.langgraph_checkpoint_path,
                 check_same_thread=False,
@@ -226,6 +231,15 @@ class LangGraphChatClient:
         builder.add_conditional_edges("call_model", tools_condition)
         builder.add_edge("tools", "call_model")
         return builder.compile(checkpointer=checkpointer or self._checkpointer)
+
+    def set_mcp_tools(self, tools: list) -> None:
+        """Merge MCP tools with local tools and rebuild the graph.
+
+        Called once during application startup after MCP connections are
+        established. All sessions will pick up the new tools immediately.
+        """
+        self._tools = [*self._local_tools, *tools]
+        self._graph = self._build_graph(streaming=False)
 
     def list_skills(self) -> list[SkillSummary]:
         return [self._to_skill_summary(skill) for skill in self.skill_catalog.list_skills()]

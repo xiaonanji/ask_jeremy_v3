@@ -1,0 +1,10 @@
+wing: ask_jeremy_v3
+rooms:
+- name: backend
+  description: Files from backend/
+- name: frontend
+  description: Files from frontend/
+- name: testing
+  description: Files from tests/
+- name: general
+  description: Files that don't fit other rooms

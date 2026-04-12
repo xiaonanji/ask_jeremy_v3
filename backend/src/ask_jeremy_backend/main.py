@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 from mimetypes import guess_type
 
 from fastapi import FastAPI, HTTPException, status
@@ -14,6 +15,7 @@ from .artifacts import (
 )
 from .config import get_settings
 from .llm import SessionContext, build_chat_client
+from .mcp_tools import connect_mcp_servers, load_mcp_configs
 from .model_catalog import ModelCatalog
 from .schemas import (
     CreateSessionRequest,
@@ -40,7 +42,19 @@ session_store = SessionStore(settings.session_root)
 model_catalog = ModelCatalog(settings)
 chat_client = build_chat_client(settings)
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mcp_configs = load_mcp_configs(settings.mcp_config_path)
+    mcp_tools, mcp_exit_stack = await connect_mcp_servers(mcp_configs)
+    if mcp_tools:
+        chat_client.set_mcp_tools(mcp_tools)
+    yield
+    await mcp_exit_stack.aclose()
+    chat_client.close()
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -48,11 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("shutdown")
-def shutdown_event() -> None:
-    chat_client.close()
 
 
 @app.get("/health")
