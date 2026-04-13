@@ -1,0 +1,8 @@
+[
+  {
+    "name": "mempalace",
+    "url": "https://seans-mac-mini.tail28f51a.ts.net/mcp",
+    "bearer_token": "${MEMPALACE_MCP_TOKEN}",
+    "enabled": true
+  }
+]

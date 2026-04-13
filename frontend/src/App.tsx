@@ -501,6 +501,13 @@ export default function App() {
           return;
         }
 
+        if (eventName === "mcp_tool_call") {
+          const serverName = String((payload as { server_name?: unknown }).server_name ?? "");
+          const toolName = String((payload as { tool_name?: unknown }).tool_name ?? "");
+          appendTraceStatusLine(`MCP: ${serverName} \u2192 ${toolName}`);
+          return;
+        }
+
         if (eventName === "error") {
           streamErrorMessage = String(
             (payload as { message?: unknown }).message ?? "Unknown stream error"
@@ -839,7 +846,8 @@ export default function App() {
 
             {activeSession ? (
               <div className="chat-controls">
-                <label className="field-select">
+                <label className="field-select field-select-database">
+                  <span>Data Source</span>
                   <select
                     aria-label="Database backend"
                     value={activeSession.session.database_backend}
@@ -853,7 +861,8 @@ export default function App() {
                   </select>
                 </label>
 
-                <label className="field-select">
+                <label className="field-select field-select-provider">
+                  <span>Provider</span>
                   <select
                     aria-label="Provider"
                     value={activeSession.session.model_provider}
@@ -869,7 +878,8 @@ export default function App() {
                   </select>
                 </label>
 
-                <label className="field-select">
+                <label className="field-select field-select-model">
+                  <span>Model</span>
                   <select
                     aria-label="Model"
                     value={activeSession.session.model_name}

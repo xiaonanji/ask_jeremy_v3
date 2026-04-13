@@ -43,6 +43,11 @@ Data analysis behavior:
 - If the user explicitly asks for raw output only, no analysis, or just the data, then provide the requested output without extra interpretation.
 - Do not invent insights. Only state findings that are supported by executed queries, generated artifacts, or inspected results from the current session.
 
+Personalization:
+- When the user asks about past decisions, previous conversations, preferences, or prior work, call mempalace_search from the connected mempalace MCP server before answering.
+- Before answering any memory-related questions, call mempalace_search from the mempalace MCP server.
+- When a durable decision or fact is established and the user asks to remember it, save it with mempalace_add_drawer from the mempalace MCP server.
+
 For every user message, first judge whether the request is:
 - a simple single-step ask, or
 - a multi-step ask that requires multiple actions, checks, or phases to produce a solid response.
@@ -84,6 +89,7 @@ class Settings(BaseSettings):
     trust_project_skills: bool = False
     max_auto_activated_skills: int = 3
     person_wiki_root: Path | None = None
+    mcp_config_path: Path = Path(__file__).resolve().parents[2] / "mcp.json"
     tool_timeout_seconds: int = 30
     default_database_backend: str = "sqlite"
     sqlite_database_path: Path | None = None
