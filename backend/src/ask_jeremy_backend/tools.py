@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import timezone, datetime
 import os
 import subprocess
 import sys
@@ -8,8 +9,14 @@ import json
 from pathlib import Path
 
 from langchain_core.tools import tool
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.config import ensure_config
 
+from .analysis import (
+    AnalysisArtifactError,
+    load_analysis_result,
+    raw_sql_artifact_paths,
+    validate_analysis_result,
+)
 from .artifacts import collect_artifacts, session_artifact_root, snapshot_artifacts
 from .config import Settings
 from .database import (
@@ -20,6 +27,12 @@ from .database import (
 )
 
 _MAX_OUTPUT_CHARS = 8_000
+
+
+def _session_id() -> str:
+    """Read the LangGraph thread_id from LangChain's ambient config context."""
+    config = ensure_config()
+    return str(config.get("configurable", {}).get("thread_id", "")).strip()
 
 
 @dataclass(frozen=True)
@@ -45,6 +58,19 @@ class LocalToolRegistry:
             timeout_seconds: int | None = None,
         ) -> str:
             """Run a local shell command. Use this for file search, repository inspection, and calling local CLIs. Prefer read-only commands unless the user explicitly asked to modify files."""
+            session_id = _session_id()
+            if _current_turn_requires_data_pipeline(settings, session_id):
+                return _format_process_result(
+                    {
+                        "exit_code": 1,
+                        "working_directory": workdir or str(settings.project_root),
+                        "stdout": "",
+                        "stderr": (
+                            "run_shell_command is disabled for database-backed turns. "
+                            "Use execute_sql_query, run_analysis_script, and read_analysis_result instead."
+                        ),
+                    }
+                )
             result = _run_process(
                 args=_shell_invocation(command),
                 settings=settings,
@@ -56,12 +82,25 @@ class LocalToolRegistry:
         @tool
         def run_python_script(
             script: str,
-            config: RunnableConfig,
             workdir: str | None = None,
             timeout_seconds: int | None = None,
         ) -> str:
             """Run inline Python using the backend interpreter. Use this for quick structured parsing, calculations, and small local inspections. Save generated charts or files into the session artifacts directory exposed as the SESSION_ARTIFACTS_PATH environment variable. The tool returns JSON with exit_code, stdout, stderr, and detected artifacts."""
-            session_id = str(config.get("configurable", {}).get("thread_id", "")).strip()
+            session_id = _session_id()
+            if _current_turn_requires_data_pipeline(settings, session_id):
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "tool_blocked",
+                        "recoverable": False,
+                        "message": (
+                            "run_python_script is disabled for database-backed turns. "
+                            "Use run_analysis_script so the analysis stays bounded and traceable."
+                        ),
+                    },
+                    indent=2,
+                )
             artifact_root = session_artifact_root(settings.session_root, session_id)
             before_snapshot = snapshot_artifacts(artifact_root)
             result = _run_process(
@@ -89,10 +128,9 @@ class LocalToolRegistry:
         @tool
         def execute_sql_query(
             query: str,
-            config: RunnableConfig,
         ) -> str:
-            """Execute a read-only SQL query against the database backend configured for the current session and save the materialized result set to the active session's artifacts folder. Supported session backends: sqlite, snowflake. Use explicit projections and filters whenever possible."""
-            session_id = str(config.get("configurable", {}).get("thread_id", "")).strip()
+            """Execute a read-only SQL query against the configured session database and save the raw result set as an internal artifact. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
+            session_id = _session_id()
             if not session_id:
                 return json.dumps(
                     {
@@ -127,18 +165,214 @@ class LocalToolRegistry:
                     "ok": True,
                     "database": result.database,
                     "artifact_id": result.artifact_id,
-                    "artifact_dir": str(result.artifact_dir),
-                    "json_path": str(result.json_path),
-                    "csv_path": str(result.csv_path),
                     "row_count": result.row_count,
                     "row_limit": settings.sql_query_max_rows,
+                    "truncated": result.truncated,
                     "columns": result.columns,
                     "created_at": result.created_at.isoformat(),
                 },
                 indent=2,
             )
 
-        return [run_shell_command, run_python_script, execute_sql_query]
+        @tool
+        def run_analysis_script(
+            raw_artifact_id: str,
+            script: str,
+            timeout_seconds: int | None = None,
+        ) -> str:
+            """Write and run a Python analysis script against a previously materialized SQL artifact. The script reads raw data from the provided environment variables and writes a structured JSON object to ANALYSIS_OUTPUT_PATH. Do NOT print raw rows to stdout — that output is not seen by the model. Available input env vars: RAW_SQL_RESULT_JSON_PATH, RAW_SQL_RESULT_CSV_PATH, RAW_ARTIFACT_JSON_PATH, RAW_ARTIFACT_CSV_PATH, RAW_RESULT_JSON_PATH, RAW_RESULT_CSV_PATH, RAW_ARTIFACT_PATH, RAW_ARTIFACT_DIR. Allowed top-level output keys: summary, metrics, findings, evidence, caveats, uncertainty, needs_user_input, follow_up_question, allowed_mentions, table. Key guidance: (1) If the user asks for a list, ranking, or set of records (e.g. 'show all schools ranked', 'give me the full table'), produce the full result in the 'table' field — do not summarize or truncate it. Set 'table' to a list of row dicts (e.g. [{"rank": 1, "school": "X", "score": 95}]) or an object with 'headers' (list of strings) and 'rows' (list of lists). Supports up to 500 rows and 20 columns. (2) If the user asks for a summary, aggregate, or insight, use metrics/findings/evidence instead. (3) Put scalar numbers in metrics or evidence, not as bare top-level keys. (4) If the SQL artifact was truncated, disclose it in caveats. On success, this tool returns the validated analysis result inline so the model answers directly from it."""
+            session_id = _session_id()
+            if not session_id:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "runtime_error",
+                        "recoverable": False,
+                        "message": "Missing session id for analysis execution.",
+                    },
+                    indent=2,
+                )
+
+            try:
+                raw_json_path, raw_csv_path = raw_sql_artifact_paths(
+                    settings,
+                    session_id,
+                    raw_artifact_id,
+                )
+            except AnalysisArtifactError as exc:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "analysis_input_error",
+                        "recoverable": False,
+                        "message": str(exc),
+                    },
+                    indent=2,
+                )
+
+            artifact_root = session_artifact_root(settings.session_root, session_id)
+            if artifact_root is None:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "runtime_error",
+                        "recoverable": False,
+                        "message": "Missing session artifact root for analysis execution.",
+                    },
+                    indent=2,
+                )
+
+            now = datetime.now(timezone.utc)
+            analysis_id = f"analysis_{now.strftime('%Y%m%dT%H%M%SZ')}_{os.urandom(4).hex()}"
+            analysis_dir = artifact_root / "analysis" / analysis_id
+            analysis_dir.mkdir(parents=True, exist_ok=False)
+            script_path = analysis_dir / "analysis.py"
+            output_path = analysis_dir / "analysis_result.json"
+            stdout_path = analysis_dir / "stdout.txt"
+            stderr_path = analysis_dir / "stderr.txt"
+            script_path.write_text(script, encoding="utf-8")
+
+            result = _run_process(
+                args=[sys.executable, str(script_path)],
+                settings=settings,
+                workdir=str(analysis_dir),
+                timeout_seconds=timeout_seconds,
+                session_id=session_id,
+                artifact_root=artifact_root,
+                extra_env={
+                    "RAW_SQL_RESULT_JSON_PATH": str(raw_json_path),
+                    "RAW_SQL_RESULT_CSV_PATH": str(raw_csv_path),
+                    "RAW_ARTIFACT_JSON_PATH": str(raw_json_path),
+                    "RAW_ARTIFACT_CSV_PATH": str(raw_csv_path),
+                    "RAW_RESULT_JSON_PATH": str(raw_json_path),
+                    "RAW_RESULT_CSV_PATH": str(raw_csv_path),
+                    "RAW_ARTIFACT_PATH": str(raw_json_path),
+                    "RAW_ARTIFACT_DIR": str(raw_json_path.parent),
+                    "ANALYSIS_ARTIFACT_DIR": str(analysis_dir),
+                    "ANALYSIS_OUTPUT_PATH": str(output_path),
+                },
+            )
+            stdout = str(result.get("stdout", ""))
+            stderr = str(result.get("stderr", ""))
+            stdout_path.write_text(stdout, encoding="utf-8")
+            stderr_path.write_text(stderr, encoding="utf-8")
+
+            if result["exit_code"] != 0:
+                return json.dumps(
+                    {
+                        "exit_code": result["exit_code"],
+                        "ok": False,
+                        "error_type": "analysis_execution_error",
+                        "recoverable": True,
+                        "message": "Analysis script failed. Inspect stdout/stderr, amend the script, and retry.",
+                        "analysis_artifact_id": analysis_id,
+                        "artifact_dir": str(analysis_dir),
+                        "script_path": str(script_path),
+                        "stdout_path": str(stdout_path),
+                        "stderr_path": str(stderr_path),
+                    },
+                    indent=2,
+                )
+
+            try:
+                analysis_result = load_analysis_result(settings, session_id, analysis_id)
+            except AnalysisArtifactError as exc:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "analysis_output_error",
+                        "recoverable": True,
+                        "message": (
+                            f"{exc} Allowed top-level keys are: "
+                            "summary, metrics, findings, evidence, caveats, uncertainty, "
+                            "needs_user_input, follow_up_question, allowed_mentions, table."
+                        ),
+                        "analysis_artifact_id": analysis_id,
+                        "artifact_dir": str(analysis_dir),
+                        "script_path": str(script_path),
+                        "stdout_path": str(stdout_path),
+                        "stderr_path": str(stderr_path),
+                    },
+                    indent=2,
+                )
+
+            analysis_result = _attach_sql_truncation_signal(
+                raw_json_path=raw_json_path,
+                analysis_result=analysis_result,
+            )
+            analysis_result = validate_analysis_result(analysis_result)
+            output_path.write_text(json.dumps(analysis_result, indent=2), encoding="utf-8")
+
+            return json.dumps(
+                {
+                    "exit_code": 0,
+                    "ok": True,
+                    "raw_artifact_id": raw_artifact_id,
+                    "analysis_artifact_id": analysis_id,
+                    "artifact_dir": str(analysis_dir),
+                    "script_path": str(script_path),
+                    "output_path": str(output_path),
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "result": analysis_result,
+                },
+                indent=2,
+            )
+
+        @tool
+        def read_analysis_result(
+            analysis_artifact_id: str,
+        ) -> str:
+            """Read a previously validated analysis result. This returns only bounded analysis JSON, never raw SQL rows."""
+            session_id = _session_id()
+            if not session_id:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "runtime_error",
+                        "recoverable": False,
+                        "message": "Missing session id for analysis result reading.",
+                    },
+                    indent=2,
+                )
+
+            try:
+                payload = load_analysis_result(settings, session_id, analysis_artifact_id)
+            except AnalysisArtifactError as exc:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "analysis_output_error",
+                        "recoverable": False,
+                        "message": str(exc),
+                        "analysis_artifact_id": analysis_artifact_id,
+                    },
+                    indent=2,
+                )
+
+            return json.dumps(
+                {
+                    "exit_code": 0,
+                    "ok": True,
+                    "analysis_artifact_id": analysis_artifact_id,
+                    "result": payload,
+                },
+                indent=2,
+            )
+
+        return [
+            run_shell_command,
+            run_python_script,
+            execute_sql_query,
+            run_analysis_script,
+            read_analysis_result,
+        ]
 
 
 def _run_process(
@@ -149,6 +383,7 @@ def _run_process(
     timeout_seconds: int | None,
     session_id: str | None = None,
     artifact_root: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     cwd = _resolve_workdir(workdir, settings.project_root)
     if cwd is None:
@@ -170,6 +405,8 @@ def _run_process(
     if artifact_root is not None:
         artifact_root.mkdir(parents=True, exist_ok=True)
         env.setdefault("SESSION_ARTIFACTS_PATH", str(artifact_root))
+    if extra_env:
+        env.update(extra_env)
 
     try:
         completed = subprocess.run(
@@ -311,3 +548,115 @@ def _format_process_result(result: dict[str, object]) -> str:
     if not stdout and not stderr:
         sections.append("No output.")
     return "\n\n".join(sections)
+
+
+def _current_turn_requires_data_pipeline(settings: Settings, session_id: str) -> bool:
+    latest_user_message = _latest_user_message(settings, session_id)
+    return _looks_like_data_request(latest_user_message)
+
+
+def _latest_user_message(settings: Settings, session_id: str) -> str:
+    if not session_id:
+        return ""
+    messages_path = settings.session_root / session_id / "messages.json"
+    if not messages_path.exists():
+        return ""
+    try:
+        payload = json.loads(messages_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, list):
+        return ""
+    for item in reversed(payload):
+        if isinstance(item, dict) and item.get("role") == "user":
+            content = item.get("content")
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+def _looks_like_data_request(text: str) -> bool:
+    normalized = text.lower()
+    if not normalized:
+        return False
+    patterns = (
+        "how many",
+        "count",
+        "list",
+        "show",
+        "rank",
+        "top ",
+        "bottom ",
+        "distribution",
+        "average",
+        "sum",
+        "median",
+        "mean",
+        "compare",
+        "trend",
+        "school",
+        "student",
+        "award",
+        "database",
+        "table",
+        "dataset",
+        "sql",
+        "query",
+        "chart",
+        "plot",
+    )
+    return any(pattern in normalized for pattern in patterns)
+
+
+def _attach_sql_truncation_signal(
+    *,
+    raw_json_path: Path,
+    analysis_result: dict[str, object],
+) -> dict[str, object]:
+    try:
+        raw_payload = json.loads(raw_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return analysis_result
+    if not isinstance(raw_payload, dict) or not raw_payload.get("truncated"):
+        return analysis_result
+
+    row_limit = raw_payload.get("row_limit")
+    row_count = raw_payload.get("row_count")
+    result = dict(analysis_result)
+    metrics = dict(result.get("metrics", {}))
+    metrics["sql_result_truncated"] = True
+    if isinstance(row_limit, int):
+        metrics["sql_row_limit"] = row_limit
+    if isinstance(row_count, int):
+        metrics["sql_materialized_row_count"] = row_count
+    result["metrics"] = metrics
+
+    caveats = list(result.get("caveats", []))
+    truncation_note = (
+        f"SQL materialization was truncated to the first {row_limit} rows for safety; "
+        "do not generalize beyond that window."
+        if isinstance(row_limit, int)
+        else "SQL materialization was truncated for safety; do not generalize beyond the returned rows."
+    )
+    if truncation_note not in caveats:
+        caveats.append(truncation_note)
+    result["caveats"] = caveats
+
+    evidence = list(result.get("evidence", []))
+    if not any(
+        isinstance(item, dict) and item.get("label") == "sql_result_truncated"
+        for item in evidence
+    ):
+        evidence.append(
+            {
+                "label": "sql_result_truncated",
+                "detail": "The SQL artifact was truncated during materialization.",
+                "value": {
+                    "truncated": True,
+                    "row_limit": row_limit,
+                    "materialized_row_count": row_count,
+                },
+            }
+        )
+    result["evidence"] = evidence
+    return result

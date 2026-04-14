@@ -13,11 +13,11 @@ from uuid import uuid4
 
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.messages import AIMessageChunk, AnyMessage, BaseMessage
+from langchain_core.messages import AIMessageChunk, AnyMessage, BaseMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 
 from .config import Settings
@@ -226,10 +226,20 @@ class LangGraphChatClient:
         builder.add_node("select_skills", self._select_skills)
         builder.add_node("call_model", self._call_model)
         builder.add_node("tools", ToolNode(self._tools))
+        builder.add_node("enforce_analysis", self._enforce_data_pipeline)
         builder.add_edge(START, "select_skills")
         builder.add_edge("select_skills", "call_model")
-        builder.add_conditional_edges("call_model", tools_condition)
+        builder.add_conditional_edges(
+            "call_model",
+            self._route_after_model,
+            {
+                "tools": "tools",
+                "enforce_analysis": "enforce_analysis",
+                "end": END,
+            },
+        )
         builder.add_edge("tools", "call_model")
+        builder.add_edge("enforce_analysis", "call_model")
         return builder.compile(checkpointer=checkpointer or self._checkpointer)
 
     def set_mcp_tools(self, tools: list) -> None:
@@ -282,9 +292,9 @@ class LangGraphChatClient:
 
         current_ids = list(state.get("active_skill_ids", []))
 
-        # Always include person-wiki-knowledge skill if available and PERSON_WIKI_ROOT is configured
+        # Always include person-wiki-knowledge skill only for background/context questions.
         always_active_skills = []
-        if context.person_wiki_root:
+        if context.person_wiki_root and not self._looks_like_data_request(latest_user_message):
             wiki_skill = self.skill_catalog.get_by_name("person-wiki-knowledge")
             if wiki_skill and wiki_skill.id not in current_ids:
                 always_active_skills.append(wiki_skill.id)
@@ -352,9 +362,10 @@ class LangGraphChatClient:
                 ]
             }
 
-        messages = list(state["messages"])
-        if context.max_history_messages > 0:
-            messages = messages[-context.max_history_messages :]
+        messages = _trim_message_history(
+            list(state["messages"]),
+            context.max_history_messages,
+        )
 
         prompt = [
             SystemMessage(
@@ -374,12 +385,74 @@ class LangGraphChatClient:
             *self._skill_prompt_messages(state),
             *messages,
         ]
-        response = self._get_model(context).bind_tools(self._tools).invoke(prompt)
+        response = self._get_model(context).bind_tools(self._tools_for_turn(state)).invoke(prompt)
         if not isinstance(response, AIMessage):
             response = AIMessage(content=str(response))
         if not response.id:
             response = response.model_copy(update={"id": str(uuid4())})
         return {"messages": [response]}
+
+    def _enforce_data_pipeline(
+        self,
+        state: SkillAwareState,
+        runtime: Runtime[GraphContext],
+    ) -> dict[str, list[SystemMessage]]:
+        messages = state.get("messages", [])
+        sql_artifact_id = self._latest_sql_artifact_id(messages)
+        if sql_artifact_id:
+            guidance = (
+                "This is a data-backed request. Do not answer yet. "
+                f"You already have raw SQL artifact `{sql_artifact_id}` for the current turn. "
+                "Write and run a Python analysis script with `run_analysis_script`. "
+                "The script must write its output to ANALYSIS_OUTPUT_PATH as JSON — do not print raw rows to stdout. "
+                "If the user asked for a full list or ranking (e.g. 'show all schools'), output the complete records in the 'table' field; do not summarize or truncate. "
+                "Answer only from the bounded analysis result returned by the tool (or `read_analysis_result` if needed). "
+                "Generic shell and inline Python tools are unavailable for this turn. "
+                "If the user request is ambiguous, ask a clarifying question instead of guessing."
+            )
+        else:
+            guidance = (
+                "This is a data-backed request. Do not answer yet. "
+                "Run `execute_sql_query`, then `run_analysis_script`, and answer only from the bounded analysis result returned by that tool. "
+                "The script must write its output to ANALYSIS_OUTPUT_PATH as JSON — do not print raw rows to stdout. "
+                "If the user asked for a full list or ranking (e.g. 'show all schools'), output the complete records in the 'table' field of the analysis result; do not summarize or truncate. "
+                "Use `read_analysis_result` only if you need to reread an earlier analysis artifact. "
+                "Generic shell and inline Python tools are unavailable for this turn. "
+                "If the request is ambiguous, ask a clarifying question instead of guessing."
+            )
+        return {"messages": [SystemMessage(content=guidance)]}
+
+    def _route_after_model(self, state: SkillAwareState) -> str:
+        messages = state.get("messages", [])
+        assistant_message = self._latest_ai_message(messages)
+        if assistant_message is None:
+            return "end"
+
+        if getattr(assistant_message, "tool_calls", None):
+            return "tools"
+
+        if not self._requires_data_pipeline(messages):
+            return "end"
+
+        if self._assistant_requests_clarification(assistant_message):
+            return "end"
+
+        if self._has_terminal_tool_error(messages):
+            return "end"
+
+        if self._latest_analysis_result(messages) is None:
+            return "enforce_analysis"
+
+        return "end"
+
+    def _tools_for_turn(self, state: SkillAwareState) -> list:
+        if not self._requires_data_pipeline(state.get("messages", [])):
+            return self._tools
+        blocked_names = {"run_shell_command", "run_python_script"}
+        return [
+            tool for tool in self._tools
+            if getattr(tool, "name", "") not in blocked_names
+        ]
 
     def _get_model(self, context: GraphContext):
         key = (
@@ -498,6 +571,123 @@ class LangGraphChatClient:
         # Fallback for any other format
         return str(content).strip()
 
+    def _latest_ai_message(self, messages: list[BaseMessage]) -> AIMessage | None:
+        return next(
+            (message for message in reversed(messages) if isinstance(message, AIMessage)),
+            None,
+        )
+
+    def _requires_data_pipeline(self, messages: list[BaseMessage]) -> bool:
+        latest_user = next(
+            (
+                self._message_text(message)
+                for message in reversed(messages)
+                if isinstance(message, HumanMessage)
+            ),
+            "",
+        ).lower()
+        if not latest_user:
+            return False
+
+        if self._latest_sql_artifact_id(messages) or self._latest_analysis_result(messages):
+            return True
+
+        return self._looks_like_data_request(latest_user)
+
+    def _looks_like_data_request(self, text: str) -> bool:
+        normalized = text.lower()
+        if not normalized:
+            return False
+
+        patterns = (
+            "how many",
+            "count",
+            "list",
+            "show",
+            "rank",
+            "top ",
+            "bottom ",
+            "distribution",
+            "average",
+            "sum",
+            "median",
+            "mean",
+            "compare",
+            "trend",
+            "school",
+            "student",
+            "award",
+            "database",
+            "table",
+            "dataset",
+            "sql",
+            "query",
+            "chart",
+            "plot",
+        )
+        return any(pattern in normalized for pattern in patterns)
+
+    def _assistant_requests_clarification(self, message: AIMessage) -> bool:
+        text = self._message_text(message).lower()
+        if "?" not in text:
+            return False
+        clarifiers = (
+            "clarify",
+            "which",
+            "what exactly",
+            "what should",
+            "do you want",
+            "can you confirm",
+            "could you confirm",
+            "which table",
+            "which metric",
+        )
+        return any(item in text for item in clarifiers)
+
+    def _has_terminal_tool_error(self, messages: list[BaseMessage]) -> bool:
+        for payload in self._current_turn_tool_payloads(messages):
+            if payload.get("ok") is False and payload.get("recoverable") is False:
+                return True
+        return False
+
+    def _latest_sql_artifact_id(self, messages: list[BaseMessage]) -> str | None:
+        for payload in reversed(self._current_turn_tool_payloads(messages)):
+            artifact_id = payload.get("artifact_id")
+            if payload.get("ok") is True and isinstance(artifact_id, str) and artifact_id:
+                return artifact_id
+        return None
+
+    def _latest_analysis_result(self, messages: list[BaseMessage]) -> dict[str, object] | None:
+        for payload in reversed(self._current_turn_tool_payloads(messages)):
+            result = payload.get("result")
+            if payload.get("ok") is True and isinstance(result, dict):
+                return result
+        return None
+
+    def _current_turn_tool_payloads(self, messages: list[BaseMessage]) -> list[dict[str, object]]:
+        current_turn = self._messages_since_latest_human(messages)
+        payloads: list[dict[str, object]] = []
+        for message in current_turn:
+            if not isinstance(message, ToolMessage):
+                continue
+            content = self._message_text(message)
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                payloads.append(parsed)
+        return payloads
+
+    def _messages_since_latest_human(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        latest_human_index = -1
+        for index, message in enumerate(messages):
+            if isinstance(message, HumanMessage):
+                latest_human_index = index
+        if latest_human_index == -1:
+            return messages
+        return messages[latest_human_index + 1 :]
+
     def _final_reply_for_session(self, session_id: str, *, graph) -> GeneratedReply:
         snapshot = graph.get_state({"configurable": {"thread_id": session_id}})
         values = getattr(snapshot, "values", {}) or {}
@@ -607,3 +797,62 @@ class LangGraphChatClient:
 
 def build_chat_client(settings: Settings) -> LangGraphChatClient:
     return LangGraphChatClient(settings)
+
+
+def _trim_message_history(
+    messages: list[BaseMessage],
+    max_messages: int,
+) -> list[BaseMessage]:
+    """Trim message history to at most max_messages, keeping tool-call sequences intact.
+
+    Three problems are handled here:
+    1. A naive tail-slice can cut between AIMessage(tool_calls=[X]) and ToolMessage(X),
+       producing a 400 from the model API.
+    2. A mid-turn crash (or the previous missing-config bug) can leave a trailing
+       AIMessage(tool_calls=[X]) with no ToolMessage in the LangGraph checkpoint.
+       When the user sends a new message the HumanMessage lands *after* the orphan,
+       so we must drop only the orphaned AIMessage, not the messages that follow.
+    3. The trim boundary can produce leading orphan ToolMessages whose AIMessage
+       parent was sliced away.
+
+    Strategy: trim first, then do a single forward pass that rebuilds the list,
+    skipping any incomplete AIMessage(tool_calls) block and any leading orphan
+    ToolMessages.
+    """
+    if max_messages > 0 and len(messages) > max_messages:
+        messages = messages[-max_messages:]
+
+    # Drop leading orphan ToolMessages (their AIMessage parent was cut by the trim).
+    start = 0
+    while start < len(messages) and isinstance(messages[start], ToolMessage):
+        start += 1
+    messages = messages[start:]
+
+    # Forward pass: keep every message except AIMessage(tool_calls) blocks where
+    # at least one tool_call_id has no matching ToolMessage immediately after.
+    result: list[BaseMessage] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        tool_calls = getattr(msg, "tool_calls", None) if isinstance(msg, AIMessage) else None
+
+        if not isinstance(msg, AIMessage) or not tool_calls:
+            result.append(msg)
+            i += 1
+            continue
+
+        # Collect the ToolMessages that immediately follow this AIMessage.
+        call_ids = {tc["id"] for tc in tool_calls if isinstance(tc, dict) and "id" in tc}
+        j = i + 1
+        while j < len(messages) and isinstance(messages[j], ToolMessage):
+            call_ids.discard(getattr(messages[j], "tool_call_id", None))
+            j += 1
+
+        if not call_ids:
+            # All tool_call_ids answered — include the whole block.
+            result.extend(messages[i:j])
+        # else: incomplete block — silently drop the AIMessage and its partial
+        # ToolMessages; everything after j is kept normally.
+        i = j
+
+    return result

@@ -163,16 +163,17 @@ async def connect_mcp_servers(
         if cfg.bearer_token:
             headers["Authorization"] = f"Bearer {cfg.bearer_token}"
         try:
-            client: MultiServerMCPClient = await exit_stack.enter_async_context(
-                MultiServerMCPClient({
+            client = MultiServerMCPClient(
+                {
                     cfg.name: {
                         "url": cfg.url,
                         "transport": "streamable_http",
                         "headers": headers,
                     }
-                })
+                }
             )
-            for tool in client.get_tools():
+            server_tools = await client.get_tools(server_name=cfg.name)
+            for tool in server_tools:
                 tools.append(McpToolProxy(inner=tool, server_name=cfg.name))
         except Exception as exc:
             warnings.warn(

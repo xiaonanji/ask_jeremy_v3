@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -37,6 +36,7 @@ class QueryArtifact:
     query: str
     executed_query: str
     row_count: int
+    truncated: bool
     columns: list[str]
     artifact_dir: Path
     json_path: Path
@@ -56,12 +56,12 @@ class SqlQueryExecutor:
     ) -> QueryArtifact:
         normalized_database = self._session_database_backend(session_id)
         sanitized_query = _sanitize_query(query)
-        executed_query = _apply_row_limit(sanitized_query, self.settings.sql_query_max_rows)
+        executed_query = sanitized_query
 
         if normalized_database == "sqlite":
-            columns, rows = self._execute_sqlite(executed_query)
+            columns, rows, truncated = self._execute_sqlite(executed_query)
         elif normalized_database == "snowflake":
-            columns, rows = self._execute_snowflake(executed_query)
+            columns, rows, truncated = self._execute_snowflake(executed_query)
         else:
             raise DatabaseConfigurationError(
                 f"Unsupported database backend: {normalized_database!r}. "
@@ -78,6 +78,7 @@ class SqlQueryExecutor:
             "created_at": created_at.isoformat(),
             "row_count": len(rows),
             "row_limit": self.settings.sql_query_max_rows,
+            "truncated": truncated,
             "columns": columns,
             "query": sanitized_query,
             "executed_query": executed_query,
@@ -92,6 +93,7 @@ class SqlQueryExecutor:
             query=sanitized_query,
             executed_query=executed_query,
             row_count=len(rows),
+            truncated=truncated,
             columns=columns,
             artifact_dir=artifact_dir,
             json_path=json_path,
@@ -99,7 +101,7 @@ class SqlQueryExecutor:
             created_at=created_at,
         )
 
-    def _execute_sqlite(self, query: str) -> tuple[list[str], list[dict[str, Any]]]:
+    def _execute_sqlite(self, query: str) -> tuple[list[str], list[dict[str, Any]], bool]:
         database_path = self.settings.sqlite_database_path
         if database_path is None:
             raise DatabaseConfigurationError(
@@ -129,14 +131,19 @@ class SqlQueryExecutor:
             )
             cursor = connection.execute(query)
             columns = [item[0] for item in (cursor.description or [])]
+            truncated = False
+            raw_rows = cursor.fetchmany(self.settings.sql_query_max_rows + 1)
+            if len(raw_rows) > self.settings.sql_query_max_rows:
+                truncated = True
+                raw_rows = raw_rows[: self.settings.sql_query_max_rows]
             rows = [
                 {
                     column: _to_json_value(row[column])
                     for column in columns
                 }
-                for row in cursor.fetchall()
+                for row in raw_rows
             ]
-            return columns, rows
+            return columns, rows, truncated
         except sqlite3.Error as exc:
             if "interrupted" in str(exc).lower():
                 raise DatabaseConnectorError(
@@ -147,7 +154,7 @@ class SqlQueryExecutor:
             connection.set_progress_handler(None, 0)
             connection.close()
 
-    def _execute_snowflake(self, query: str) -> tuple[list[str], list[dict[str, Any]]]:
+    def _execute_snowflake(self, query: str) -> tuple[list[str], list[dict[str, Any]], bool]:
         connection_kwargs = self._snowflake_connection_kwargs()
 
         try:
@@ -163,14 +170,19 @@ class SqlQueryExecutor:
                 try:
                     cursor.execute(query, timeout=self.settings.sql_query_timeout_seconds)
                     columns = [item[0] for item in (cursor.description or [])]
+                    truncated = False
+                    raw_rows = cursor.fetchmany(self.settings.sql_query_max_rows + 1)
+                    if len(raw_rows) > self.settings.sql_query_max_rows:
+                        truncated = True
+                        raw_rows = raw_rows[: self.settings.sql_query_max_rows]
                     rows = [
                         {
                             column: _to_json_value(value)
                             for column, value in zip(columns, record)
                         }
-                        for record in cursor.fetchall()
+                        for record in raw_rows
                     ]
-                    return columns, rows
+                    return columns, rows, truncated
                 finally:
                     cursor.close()
         except Exception as exc:  # pragma: no cover - depends on external connector/runtime
@@ -309,23 +321,6 @@ def _strip_leading_comments(query: str) -> str:
             remaining = remaining[closing_index + 2 :].lstrip()
             continue
         return remaining
-
-
-def _apply_row_limit(query: str, row_limit: int) -> str:
-    if _ends_with_row_limit(query):
-        return query
-    return f"{query}\nLIMIT {row_limit}"
-
-
-def _ends_with_row_limit(query: str) -> bool:
-    compact = " ".join(query.strip().split()).lower()
-    return bool(
-        re.search(r"\blimit\s+\d+(\s+offset\s+\d+)?\s*$", compact)
-        or re.search(r"\boffset\s+\d+\s+rows?\s+fetch\s+next\s+\d+\s+rows?\s+only\s*$", compact)
-        or re.search(r"\bfetch\s+first\s+\d+\s+rows?\s+only\s*$", compact)
-    )
-
-
 def _to_json_value(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)

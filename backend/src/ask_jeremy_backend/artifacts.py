@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from mimetypes import guess_type
 from pathlib import Path
 
-_INTERNAL_ARTIFACT_PREFIXES = ("sql/",)
+_INTERNAL_ARTIFACT_PREFIXES = ("sql/", "analysis/")
 
 
 @dataclass(frozen=True)

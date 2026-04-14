@@ -11,7 +11,7 @@ import {
   useRef,
   useState
 } from "react";
-import { flushSync } from "react-dom";
+
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -464,21 +464,10 @@ export default function App() {
             return;
           }
 
-          flushSync(() => {
-            setStreamTrace((current) => {
-              const currentDraft = current?.liveDraft ?? "";
-              // Add newline after complete sentences that end with period, question mark, or colon
-              const needsNewline = currentDraft.length > 0 &&
-                                   /[.?:]$/.test(currentDraft.trimEnd()) &&
-                                   !currentDraft.endsWith('\n');
-              const separator = needsNewline ? '\n' : '';
-
-              return {
-                liveDraft: `${currentDraft}${separator}${delta}`,
-                statusLines: current?.statusLines ?? []
-              };
-            });
-          });
+          setStreamTrace((current) => ({
+            liveDraft: (current?.liveDraft ?? "") + delta,
+            statusLines: current?.statusLines ?? []
+          }));
           return;
         }
 
@@ -960,75 +949,13 @@ export default function App() {
               </div>
             ) : null}
 
-            {activeSession?.messages.map((message) => {
-              const isArtifactPanelMessage = artifactPanel?.messageId === message.id;
-              return (
-                <article
-                  key={message.id}
-                  className={
-                    message.role === "user" ? "message-row user" : "message-row assistant"
-                  }
-                >
-                  {message.role === "assistant" ? (
-                    <div className="message-avatar">
-                      <AssistantAvatarIcon />
-                    </div>
-                  ) : null}
-
-                  <div className="message-card">
-                    <div className="message-meta">
-                      <span>{messageAuthorLabel(message.role)}</span>
-                      <span>{formatTime(message.created_at)}</span>
-                    </div>
-                    <div
-                      className={
-                        message.role === "assistant"
-                          ? "message-copy markdown-content"
-                          : "message-copy plain-text"
-                      }
-                    >
-                      {message.role === "assistant" ? (
-                        <MarkdownContent content={message.content} />
-                      ) : (
-                        message.content
-                      )}
-                    </div>
-                    {message.role === "assistant" &&
-                    message.artifacts.length > 0 &&
-                    activeSession ? (
-                      <div className="message-artifact-summary">
-                        <div className="message-artifact-summary-copy">
-                          <span className="message-artifact-summary-count">
-                            {formatArtifactCount(message.artifacts.length)}
-                          </span>
-                          <div className="message-artifact-summary-list">
-                            {message.artifacts.map((artifact) => (
-                              <span
-                                key={`${message.id}:${artifact.relative_path}`}
-                                className="message-artifact-chip"
-                              >
-                                {artifact.filename}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          className={
-                            isArtifactPanelMessage
-                              ? "message-artifact-preview-button active"
-                              : "message-artifact-preview-button"
-                          }
-                          onClick={() => handleOpenArtifactPanel(message)}
-                        >
-                          Preview
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                </article>
-              );
-            })}
+            {activeSession ? (
+              <MessageList
+                messages={activeSession.messages}
+                activeArtifactPanelMessageId={artifactPanel?.messageId ?? null}
+                onOpenArtifactPanel={handleOpenArtifactPanel}
+              />
+            ) : null}
 
             {streamTrace ? (
               <article className="message-row assistant pending">
@@ -1295,7 +1222,7 @@ function mergePlanCandidates(previousCandidate: string, latestCandidate: string)
   return mergedParts.join("\n").trim();
 }
 
-function MarkdownContent({ content }: { content: string }): ReactNode {
+const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }): ReactNode {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -1308,7 +1235,7 @@ function MarkdownContent({ content }: { content: string }): ReactNode {
       {content}
     </ReactMarkdown>
   );
-}
+});
 
 function ArtifactPreview({
   artifact,
@@ -1356,6 +1283,103 @@ function StreamingDraftContent({ content }: { content: string }): ReactNode {
     </>
   );
 }
+
+const MessageRow = memo(function MessageRow({
+  message,
+  isArtifactPanelMessage,
+  onOpenArtifactPanel,
+}: {
+  message: ChatMessage;
+  isArtifactPanelMessage: boolean;
+  onOpenArtifactPanel: (message: ChatMessage) => void;
+}): ReactNode {
+  return (
+    <article
+      className={
+        message.role === "user" ? "message-row user" : "message-row assistant"
+      }
+    >
+      {message.role === "assistant" ? (
+        <div className="message-avatar">
+          <AssistantAvatarIcon />
+        </div>
+      ) : null}
+
+      <div className="message-card">
+        <div className="message-meta">
+          <span>{messageAuthorLabel(message.role)}</span>
+          <span>{formatTime(message.created_at)}</span>
+        </div>
+        <div
+          className={
+            message.role === "assistant"
+              ? "message-copy markdown-content"
+              : "message-copy plain-text"
+          }
+        >
+          {message.role === "assistant" ? (
+            <MarkdownContent content={message.content} />
+          ) : (
+            message.content
+          )}
+        </div>
+        {message.role === "assistant" && message.artifacts.length > 0 ? (
+          <div className="message-artifact-summary">
+            <div className="message-artifact-summary-copy">
+              <span className="message-artifact-summary-count">
+                {formatArtifactCount(message.artifacts.length)}
+              </span>
+              <div className="message-artifact-summary-list">
+                {message.artifacts.map((artifact) => (
+                  <span
+                    key={`${message.id}:${artifact.relative_path}`}
+                    className="message-artifact-chip"
+                  >
+                    {artifact.filename}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              className={
+                isArtifactPanelMessage
+                  ? "message-artifact-preview-button active"
+                  : "message-artifact-preview-button"
+              }
+              onClick={() => onOpenArtifactPanel(message)}
+            >
+              Preview
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
+});
+
+const MessageList = memo(function MessageList({
+  messages,
+  activeArtifactPanelMessageId,
+  onOpenArtifactPanel,
+}: {
+  messages: ChatMessage[];
+  activeArtifactPanelMessageId: string | null;
+  onOpenArtifactPanel: (message: ChatMessage) => void;
+}): ReactNode {
+  return (
+    <>
+      {messages.map((message) => (
+        <MessageRow
+          key={message.id}
+          message={message}
+          isArtifactPanelMessage={activeArtifactPanelMessageId === message.id}
+          onOpenArtifactPanel={onOpenArtifactPanel}
+        />
+      ))}
+    </>
+  );
+});
 
 function parseStreamingDraft(value: string): ParsedStreamingDraft {
   const planHeaderMatch = value.match(/(?:^|\n)(\*\*Plan\*\*|Plan)\s*(?:\n|$)/);
