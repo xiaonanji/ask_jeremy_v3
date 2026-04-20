@@ -1176,6 +1176,18 @@ body.artifact-panel-resizing {
   margin-top: 0.2rem;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .composer-shell {
   padding: 1rem 1.6rem 1.6rem;
   background: rgba(11, 15, 20, 0.9);
@@ -1189,6 +1201,50 @@ body.artifact-panel-resizing {
   background: rgba(180, 70, 57, 0.16);
   border: 1px solid rgba(242, 154, 143, 0.28);
   color: #ffd8d3;
+}
+
+.composer-status-bar {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.7rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 0.8rem;
+  background:
+    linear-gradient(180deg, rgba(255, 201, 138, 0.22), rgba(255, 171, 92, 0.16)),
+    rgba(17, 23, 32, 0.9);
+  border: 1px solid rgba(255, 186, 106, 0.32);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.composer-status-text {
+  color: #ffe0bd;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.composer-status-dots {
+  display: inline-flex;
+  min-width: 1.7em;
+}
+
+.composer-status-dot {
+  opacity: 0.18;
+  animation: composer-status-dot-step 1.2s steps(1, end) infinite;
+}
+
+.composer-status-dot-1 {
+  animation-delay: 0s;
+}
+
+.composer-status-dot-2 {
+  animation-delay: 0.4s;
+}
+
+.composer-status-dot-3 {
+  animation-delay: 0.8s;
 }
 
 .composer {
@@ -1253,6 +1309,17 @@ body.artifact-panel-resizing {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes composer-status-dot-step {
+  0%,
+  100% {
+    opacity: 0.18;
+  }
+
+  50% {
+    opacity: 1;
   }
 }
 

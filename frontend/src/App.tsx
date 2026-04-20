@@ -684,6 +684,7 @@ export default function App() {
     modelCatalog && activeProvider
       ? getModelsForProvider(modelCatalog.models, activeProvider)
       : [];
+  const showComposerStatus = isSending || !!streamTrace;
 
   return (
     <div className={isSessionRailCollapsed ? "app-shell session-rail-collapsed" : "app-shell"}>
@@ -913,9 +914,9 @@ export default function App() {
                   ? "Assistant is generating a response"
                   : error
                     ? `Error: ${error}`
-                    : activeSession
-                      ? `Viewing ${activeSession.session.title}`
-                      : "No session selected"}
+                    : !activeSession
+                      ? "No session selected"
+                      : ""}
             </div>
 
             {isBootstrapping ? (
@@ -990,6 +991,18 @@ export default function App() {
             <footer className="composer-shell">
               <div className="composer-inner">
                 {error ? <div className="error-banner">{error}</div> : null}
+                {showComposerStatus ? (
+                  <div className="composer-status-bar" role="status" aria-live="polite">
+                    <span className="composer-status-text">
+                      Jeremy is working
+                      <span className="composer-status-dots" aria-hidden="true">
+                        <span className="composer-status-dot composer-status-dot-1">.</span>
+                        <span className="composer-status-dot composer-status-dot-2">.</span>
+                        <span className="composer-status-dot composer-status-dot-3">.</span>
+                      </span>
+                    </span>
+                  </div>
+                ) : null}
 
                 <form className="composer" onSubmit={(event) => void handleSend(event)}>
                   <textarea

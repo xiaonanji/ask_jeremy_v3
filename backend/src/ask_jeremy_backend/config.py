@@ -4,7 +4,7 @@ from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-SYSTEM_PROMPT = """
+DEFAULT_SYSTEM_PROMPT = """
 You are Ask Jeremy, the foundation assistant for a data analytical agent.
 Be concise, collaborative, and explicit about uncertainty.
 Use the provided current date/time in the runtime context for time-sensitive questions.
@@ -130,7 +130,8 @@ class Settings(BaseSettings):
     anthropic_available_models: str | None = None
     anthropic_max_tokens: int = 1024
     max_history_messages: int = 20
-    system_prompt: str = SYSTEM_PROMPT
+    jeremy_prompt_path: Path | None = None
+    system_prompt: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -162,6 +163,24 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("Timeouts and row limits must be at least 1.")
         return value
+
+    @property
+    def resolved_jeremy_prompt_path(self) -> Path:
+        path = self.jeremy_prompt_path or (self.project_root / "jeremy.md")
+        if not path.is_absolute():
+            path = self.project_root / path
+        return path
+
+    @property
+    def resolved_system_prompt(self) -> str:
+        if self.system_prompt and self.system_prompt.strip():
+            return self.system_prompt.strip()
+
+        prompt_path = self.resolved_jeremy_prompt_path
+        if prompt_path.exists():
+            return prompt_path.read_text(encoding="utf-8").strip()
+
+        return DEFAULT_SYSTEM_PROMPT
 
     @property
     def cors_origins_list(self) -> list[str]:

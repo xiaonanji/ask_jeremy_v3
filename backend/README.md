@@ -36,6 +36,8 @@ Skill loading defaults:
 
 Relevant settings:
 
+- `JEREMY_PROMPT_PATH`
+- `SYSTEM_PROMPT`
 - `PROJECT_SKILL_ROOT`
 - `USER_SKILL_ROOT`
 - `ENABLE_PROJECT_SKILLS`
@@ -55,6 +57,17 @@ Relevant settings:
 - `SNOWFLAKE_DATABASE`
 - `SNOWFLAKE_SCHEMA`
 - `SNOWFLAKE_AUTHENTICATOR`
+
+## Foundation Prompt
+
+The backend now loads its always-on foundation prompt from `jeremy.md` at the repo root by default. That file is intended to hold Jeremy's durable analyst guidance and general system behavior.
+
+Optional overrides:
+
+- `JEREMY_PROMPT_PATH` to point at a different markdown file
+- `SYSTEM_PROMPT` to bypass file loading entirely and inject prompt text directly from the environment
+
+Project or user skills still layer on top of the foundation prompt and should be used for narrower, activatable specialist instructions.
 
 ## Local Tools
 

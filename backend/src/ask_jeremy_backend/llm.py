@@ -503,7 +503,7 @@ class LangGraphChatClient:
             ),
             model_provider=session.model.model_provider,
             model_name=session.model.model_name,
-            system_prompt=self.settings.system_prompt,
+            system_prompt=self.settings.resolved_system_prompt,
             api_key=api_key,
             base_url=base_url,
             max_tokens=max_tokens,
