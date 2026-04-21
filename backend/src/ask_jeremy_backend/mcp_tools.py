@@ -16,6 +16,7 @@ lifetime. Restart the backend to pick up changes to mcp.json.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pydantic
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 
 
@@ -121,13 +123,16 @@ class McpToolProxy(BaseTool):
         self._inner = inner
         self._server_name = server_name
 
-    def _run(self, *args: Any, **kwargs: Any) -> Any:
+    def _run(self, *args: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
         _emit_mcp_event(self._server_name, self.name)
-        return self._inner._run(*args, **kwargs)
+        # MCP tools from langchain-mcp-adapters are async-only.  The LangGraph
+        # ToolNode invokes tools synchronously from a worker thread (no running
+        # event loop), so we bridge to the async implementation here.
+        return asyncio.run(self._inner._arun(*args, config=config, **kwargs))
 
-    async def _arun(self, *args: Any, **kwargs: Any) -> Any:
+    async def _arun(self, *args: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
         _emit_mcp_event(self._server_name, self.name)
-        return await self._inner._arun(*args, **kwargs)
+        return await self._inner._arun(*args, config=config, **kwargs)
 
 
 # ---------------------------------------------------------------------------
