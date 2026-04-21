@@ -7,7 +7,6 @@ import {
   memo,
   MouseEvent,
   useEffect,
-  useMemo,
   useRef,
   useState
 } from "react";
@@ -78,23 +77,26 @@ function sessionMonogram(title: string): string {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
-type StreamTraceState = {
-  liveDraft: string;
-  statusLines: string[];
+type PlanItemStatus = "not started" | "in progress" | "completed";
+
+type PlanItem = {
+  key: string;
+  action: string;
+  status: PlanItemStatus;
 };
 
-type ParsedStreamingDraft = {
-  leadingMarkdown: string;
-  planItems: ParsedPlanItem[];
-  trailingMarkdown: string;
+type StreamingState = {
+  assistantMessageId: string;
+  statusLine: string;
+  planItems: PlanItem[];
 };
 
-type ParsedPlanItem = {
-  slotKey: string;
-  actionText: string;
-  statusText: string;
-  rawText: string;
-};
+const EMPTY_PLAN_ITEMS: PlanItem[] = [];
+const STATUS_ORDER: PlanItemStatus[] = ["not started", "in progress", "completed"];
+const PLAN_HEADER_PATTERN =
+  /^\s*(?:#{1,6}\s*)?\**\s*plan\s*\**\s*:?\s*$/i;
+const PLAN_ITEM_PATTERN =
+  /^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*(?:[-–—]|\||\()\s*(not started|in progress|completed)\s*\)?\s*$/i;
 
 type ArtifactPanelState = {
   messageId: string;
@@ -125,7 +127,8 @@ export default function App() {
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [streamTrace, setStreamTrace] = useState<StreamTraceState | null>(null);
+  const [streaming, setStreaming] = useState<StreamingState | null>(null);
+  const [messagePlans, setMessagePlans] = useState<Record<string, PlanItem[]>>({});
   const [artifactPanel, setArtifactPanel] = useState<ArtifactPanelState | null>(null);
   const [isSessionRailCollapsed, setIsSessionRailCollapsed] = useState(false);
   const [artifactPanelWidth, setArtifactPanelWidth] = useState(DEFAULT_ARTIFACT_PANEL_WIDTH);
@@ -188,7 +191,8 @@ export default function App() {
 
   async function bootstrap(): Promise<void> {
     setIsBootstrapping(true);
-    setStreamTrace(null);
+    setStreaming(null);
+    setMessagePlans({});
     setArtifactPanel(null);
     setError(null);
     try {
@@ -223,7 +227,8 @@ export default function App() {
   }
 
   async function handleSelectSession(sessionId: string): Promise<void> {
-    setStreamTrace(null);
+    setStreaming(null);
+    setMessagePlans({});
     setArtifactPanel(null);
     setError(null);
     try {
@@ -235,7 +240,8 @@ export default function App() {
   }
 
   async function handleNewChat(): Promise<void> {
-    setStreamTrace(null);
+    setStreaming(null);
+    setMessagePlans({});
     setArtifactPanel(null);
     setError(null);
     try {
@@ -428,16 +434,19 @@ export default function App() {
     const content = draft.trim();
     setDraft("");
     setIsSending(true);
-    setStreamTrace({
-      liveDraft: "",
-      statusLines: ["Waiting for the model response"]
-    });
     setError(null);
 
     const optimisticUserMessage: ChatMessage = {
-      id: `local-${crypto.randomUUID()}`,
+      id: `local-user-${crypto.randomUUID()}`,
       role: "user",
       content,
+      created_at: new Date().toISOString(),
+      artifacts: []
+    };
+    const optimisticAssistantMessage: ChatMessage = {
+      id: `local-assistant-${crypto.randomUUID()}`,
+      role: "assistant",
+      content: "",
       created_at: new Date().toISOString(),
       artifacts: []
     };
@@ -446,10 +455,39 @@ export default function App() {
       current
         ? {
             ...current,
-            messages: [...current.messages, optimisticUserMessage]
+            messages: [
+              ...current.messages,
+              optimisticUserMessage,
+              optimisticAssistantMessage
+            ]
           }
         : current
     );
+    setStreaming({
+      assistantMessageId: optimisticAssistantMessage.id,
+      statusLine: "Waiting for the model response",
+      planItems: []
+    });
+
+    let accumulatedContent = "";
+    let currentPlanItems: PlanItem[] = [];
+
+    const updateOptimisticAssistant = (
+      updater: (message: ChatMessage) => ChatMessage
+    ): void => {
+      setActiveSession((current) =>
+        current
+          ? {
+              ...current,
+              messages: current.messages.map((message) =>
+                message.id === optimisticAssistantMessage.id
+                  ? updater(message)
+                  : message
+              )
+            }
+          : current
+      );
+    };
 
     try {
       let didComplete = false;
@@ -464,23 +502,40 @@ export default function App() {
             return;
           }
 
-          setStreamTrace((current) => ({
-            liveDraft: (current?.liveDraft ?? "") + delta,
-            statusLines: current?.statusLines ?? []
+          accumulatedContent += delta;
+          updateOptimisticAssistant((message) => ({
+            ...message,
+            content: message.content + delta
           }));
+
+          const parsedPlan = parsePlanItemsFromContent(accumulatedContent);
+          if (parsedPlan.length > 0) {
+            currentPlanItems = mergePlans(currentPlanItems, parsedPlan);
+            const nextPlan = currentPlanItems;
+            setStreaming((current) =>
+              current ? { ...current, planItems: nextPlan } : current
+            );
+          }
           return;
         }
 
         if (eventName === "task_started") {
           const taskName = String((payload as { name?: unknown }).name ?? "");
-          appendTraceStatusLine(describeTaskStatus(taskName, "started"));
+          // Each call_model invocation is a fresh generation — drop any
+          // pre-tool-call draft so the streamed text matches the final reply.
+          // Plan items persist across resets so their in-place status updates.
+          if (taskName === "call_model") {
+            accumulatedContent = "";
+            updateOptimisticAssistant((message) => ({ ...message, content: "" }));
+          }
+          setStreamingStatus(describeTaskStatus(taskName, "started"));
           return;
         }
 
         if (eventName === "task_finished") {
           const taskName = String((payload as { name?: unknown }).name ?? "");
           const errorMessage = (payload as { error?: unknown }).error;
-          appendTraceStatusLine(
+          setStreamingStatus(
             describeTaskStatus(
               taskName,
               "finished",
@@ -493,7 +548,7 @@ export default function App() {
         if (eventName === "mcp_tool_call") {
           const serverName = String((payload as { server_name?: unknown }).server_name ?? "");
           const toolName = String((payload as { tool_name?: unknown }).tool_name ?? "");
-          appendTraceStatusLine(`MCP: ${serverName} \u2192 ${toolName}`);
+          setStreamingStatus(`MCP: ${serverName} \u2192 ${toolName}`);
           return;
         }
 
@@ -501,7 +556,7 @@ export default function App() {
           streamErrorMessage = String(
             (payload as { message?: unknown }).message ?? "Unknown stream error"
           );
-          appendTraceStatusLine("Streaming error received");
+          setStreamingStatus("Streaming error received");
           return;
         }
 
@@ -516,17 +571,41 @@ export default function App() {
           assistant_message: ChatMessage;
         };
 
+        let finalAssistantContent = donePayload.assistant_message.content;
+        if (currentPlanItems.length > 0) {
+          const { before, after, hasPlan } = splitAtPlan(finalAssistantContent);
+          if (hasPlan) {
+            finalAssistantContent = [before.trim(), after.trim()]
+              .filter((section) => section.length > 0)
+              .join("\n\n");
+          }
+          const persistedPlan = currentPlanItems;
+          setMessagePlans((prev) => ({
+            ...prev,
+            [optimisticAssistantMessage.id]: persistedPlan,
+          }));
+        }
+
         setActiveSession((current) =>
           current
             ? {
                 session: donePayload.session,
-                messages: [
-                  ...current.messages.filter(
-                    (message) => message.id !== optimisticUserMessage.id
-                  ),
-                  donePayload.user_message,
-                  donePayload.assistant_message
-                ]
+                messages: current.messages.map((message) => {
+                  // Keep the optimistic ids so React does not remount the
+                  // MessageRow when the server-returned id arrives — the row
+                  // should just absorb the final content and artifacts.
+                  if (message.id === optimisticUserMessage.id) {
+                    return { ...donePayload.user_message, id: message.id };
+                  }
+                  if (message.id === optimisticAssistantMessage.id) {
+                    return {
+                      ...donePayload.assistant_message,
+                      id: message.id,
+                      content: finalAssistantContent,
+                    };
+                  }
+                  return message;
+                })
               }
             : current
         );
@@ -539,7 +618,7 @@ export default function App() {
               right.updated_at.localeCompare(left.updated_at)
             )
         );
-        setStreamTrace(null);
+        setStreaming(null);
       });
 
       if (!didComplete) {
@@ -568,7 +647,9 @@ export default function App() {
             ? {
                 ...current,
                 messages: current.messages.filter(
-                  (message) => message.id !== optimisticUserMessage.id
+                  (message) =>
+                    message.id !== optimisticUserMessage.id &&
+                    message.id !== optimisticAssistantMessage.id
                 )
               }
             : current
@@ -576,27 +657,18 @@ export default function App() {
       }
       setError(caughtError instanceof Error ? caughtError.message : "Unknown error");
     } finally {
-      setStreamTrace(null);
+      setStreaming(null);
       setIsSending(false);
     }
   }
 
-  function appendTraceStatusLine(line: string): void {
+  function setStreamingStatus(line: string): void {
     if (!line) {
       return;
     }
-
-    setStreamTrace((current) => {
-      const existingLines = current?.statusLines ?? [];
-      if (existingLines[existingLines.length - 1] === line) {
-        return current ?? { liveDraft: "", statusLines: [line] };
-      }
-
-      return {
-        liveDraft: current?.liveDraft ?? "",
-        statusLines: [...existingLines, line].slice(-5)
-      };
-    });
+    setStreaming((current) =>
+      current ? { ...current, statusLine: line } : current
+    );
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
@@ -684,7 +756,7 @@ export default function App() {
     modelCatalog && activeProvider
       ? getModelsForProvider(modelCatalog.models, activeProvider)
       : [];
-  const showComposerStatus = isSending || !!streamTrace;
+  const showComposerStatus = isSending || !!streaming;
 
   return (
     <div className={isSessionRailCollapsed ? "app-shell session-rail-collapsed" : "app-shell"}>
@@ -698,7 +770,7 @@ export default function App() {
                 }
               >
                 <div className="brand-mark">
-                  <AppLogo isWorking={isSending || !!streamTrace} />
+                  <AppLogo isWorking={isSending || !!streaming} />
                 </div>
                 {isSessionRailCollapsed ? (
                   <button
@@ -954,34 +1026,12 @@ export default function App() {
               <MessageList
                 messages={activeSession.messages}
                 activeArtifactPanelMessageId={artifactPanel?.messageId ?? null}
+                streamingMessageId={streaming?.assistantMessageId ?? null}
+                streamingStatus={streaming?.statusLine ?? ""}
+                streamingPlanItems={streaming?.planItems ?? EMPTY_PLAN_ITEMS}
+                messagePlans={messagePlans}
                 onOpenArtifactPanel={handleOpenArtifactPanel}
               />
-            ) : null}
-
-            {streamTrace ? (
-              <article className="message-row assistant pending">
-                <div className="message-avatar">
-                  <AssistantAvatarIcon />
-                </div>
-                <div className="message-card">
-                  <div className="message-meta">
-                    <span>Jeremy</span>
-                    <span>working</span>
-                  </div>
-                  <div className="stream-status-list">
-                    {streamTrace.statusLines.map((line, index) => (
-                      <div key={`${line}-${index}`} className="stream-status-line">
-                        {line}
-                      </div>
-                    ))}
-                  </div>
-                  <div className="message-copy markdown-content">
-                    <StreamingDraftContent
-                      content={formatStreamingDraft(streamTrace.liveDraft) || "Working on it..."}
-                    />
-                  </div>
-                </div>
-              </article>
             ) : null}
 
             <div ref={messagesEndRef} />
@@ -1130,49 +1180,6 @@ function describeTaskStatus(
     : `${taskName || "Task"} complete`;
 }
 
-function formatStreamingDraft(value: string): string {
-  if (!value.trim()) {
-    return "";
-  }
-
-  const planCandidates = collectPlanCandidates(value);
-  if (planCandidates.length <= 1) {
-    return value;
-  }
-
-  const previousCandidate = value
-    .slice(planCandidates[planCandidates.length - 2], planCandidates[planCandidates.length - 1])
-    .trim();
-  const latestCandidate = value.slice(planCandidates[planCandidates.length - 1]).trimStart();
-
-  return mergePlanCandidates(previousCandidate, latestCandidate);
-}
-
-function collectPlanCandidates(value: string): number[] {
-  const matches = Array.from(value.matchAll(/(?:\*\*Plan\*\*|Plan)/g));
-  if (matches.length === 0) {
-    return [];
-  }
-
-  const candidates: number[] = [];
-  for (const match of matches) {
-    const startIndex = match.index ?? 0;
-    const lookahead = value.slice(startIndex, startIndex + 160);
-    if (looksLikePlanSection(lookahead)) {
-      candidates.push(startIndex);
-    }
-  }
-  return candidates;
-}
-
-function looksLikePlanSection(value: string): boolean {
-  if (!value.startsWith("Plan") && !value.startsWith("**Plan**")) {
-    return false;
-  }
-
-  return /(?:^|\n|\r)\s*(?:[-*]\s|\d+\.\s)/.test(value) || value.length <= 12;
-}
-
 function formatArtifactCount(count: number): string {
   return count === 1 ? "1 output" : `${count} outputs`;
 }
@@ -1204,6 +1211,160 @@ function clampArtifactPanelWidth(width: number): number {
   return Math.min(MAX_ARTIFACT_PANEL_WIDTH, Math.max(MIN_ARTIFACT_PANEL_WIDTH, width));
 }
 
+function normalizePlanKey(action: string): string {
+  return action
+    .toLowerCase()
+    .replace(/\*+/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function progressStatus(
+  previous: PlanItemStatus,
+  next: PlanItemStatus
+): PlanItemStatus {
+  const previousRank = STATUS_ORDER.indexOf(previous);
+  const nextRank = STATUS_ORDER.indexOf(next);
+  if (nextRank < 0) {
+    return previous;
+  }
+  if (previousRank < 0) {
+    return next;
+  }
+  return nextRank >= previousRank ? next : previous;
+}
+
+function parsePlanItemsFromContent(content: string): PlanItem[] {
+  const lines = content.split(/\r?\n/);
+  const items: PlanItem[] = [];
+  let inPlanSection = false;
+  let sawItem = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+
+    if (!inPlanSection) {
+      if (PLAN_HEADER_PATTERN.test(line)) {
+        inPlanSection = true;
+        sawItem = false;
+      }
+      continue;
+    }
+
+    if (line.trim() === "") {
+      if (sawItem) {
+        const hasMoreItems = lines
+          .slice(index + 1)
+          .some((future) => PLAN_ITEM_PATTERN.test(future));
+        if (!hasMoreItems) {
+          break;
+        }
+      }
+      continue;
+    }
+
+    const match = PLAN_ITEM_PATTERN.exec(line);
+    if (!match) {
+      if (sawItem) {
+        break;
+      }
+      continue;
+    }
+
+    const action = match[1].replace(/\*+/g, "").trim();
+    const status = match[2].toLowerCase() as PlanItemStatus;
+    items.push({
+      key: normalizePlanKey(action),
+      action,
+      status,
+    });
+    sawItem = true;
+  }
+
+  return items;
+}
+
+function mergePlans(previous: PlanItem[], current: PlanItem[]): PlanItem[] {
+  if (current.length === 0) {
+    return previous;
+  }
+
+  const previousByKey = new Map<string, PlanItem>();
+  for (const item of previous) {
+    if (item.key) {
+      previousByKey.set(item.key, item);
+    }
+  }
+
+  const merged: PlanItem[] = [];
+  const absorbedKeys = new Set<string>();
+
+  current.forEach((item, index) => {
+    const existing =
+      (item.key && previousByKey.get(item.key)) ||
+      (!absorbedKeys.has(previous[index]?.key ?? "") ? previous[index] : undefined);
+
+    if (existing) {
+      absorbedKeys.add(existing.key);
+      merged.push({
+        key: existing.key || item.key,
+        action: item.action || existing.action,
+        status: progressStatus(existing.status, item.status),
+      });
+    } else {
+      merged.push(item);
+      if (item.key) {
+        absorbedKeys.add(item.key);
+      }
+    }
+  });
+
+  for (const item of previous) {
+    if (!absorbedKeys.has(item.key)) {
+      merged.push(item);
+      absorbedKeys.add(item.key);
+    }
+  }
+
+  return merged;
+}
+
+function splitAtPlan(content: string): {
+  before: string;
+  after: string;
+  hasPlan: boolean;
+} {
+  const lines = content.split(/\r?\n/);
+  let headerIndex = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (PLAN_HEADER_PATTERN.test(lines[index])) {
+      headerIndex = index;
+      break;
+    }
+  }
+  if (headerIndex < 0) {
+    return { before: content, after: "", hasPlan: false };
+  }
+
+  let lastItemIndex = headerIndex;
+  for (let index = headerIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() === "") {
+      continue;
+    }
+    if (PLAN_ITEM_PATTERN.test(line)) {
+      lastItemIndex = index;
+      continue;
+    }
+    break;
+  }
+
+  const before = lines.slice(0, headerIndex).join("\n");
+  const after = lines.slice(lastItemIndex + 1).join("\n");
+  return { before, after, hasPlan: true };
+}
+
 function isEmbeddableArtifact(artifact: ChatArtifact): boolean {
   const mediaType = artifact.mime_type?.toLowerCase() ?? "";
   return (
@@ -1212,27 +1373,6 @@ function isEmbeddableArtifact(artifact: ChatArtifact): boolean {
     mediaType === "application/pdf" ||
     mediaType === "application/json"
   );
-}
-
-function mergePlanCandidates(previousCandidate: string, latestCandidate: string): string {
-  const previousDraft = parseStreamingDraft(previousCandidate);
-  const latestDraft = parseStreamingDraft(latestCandidate);
-
-  if (latestDraft.planItems.length === 0) {
-    return latestCandidate;
-  }
-
-  const mergedItems = latestDraft.planItems.map((item) => item.rawText);
-  for (let index = latestDraft.planItems.length; index < previousDraft.planItems.length; index += 1) {
-    mergedItems.push(previousDraft.planItems[index].rawText);
-  }
-
-  const mergedParts = ["Plan", ...mergedItems.map((item) => `- ${item}`)];
-  if (latestDraft.trailingMarkdown) {
-    mergedParts.push(latestDraft.trailingMarkdown);
-  }
-
-  return mergedParts.join("\n").trim();
 }
 
 const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }): ReactNode {
@@ -1282,17 +1422,66 @@ function ArtifactPreview({
   );
 }
 
-function StreamingDraftContent({ content }: { content: string }): ReactNode {
-  const parsed = useMemo(() => parseStreamingDraft(content), [content]);
-  if (parsed.planItems.length === 0) {
-    return <MarkdownContent content={content} />;
+const StreamingPlan = memo(function StreamingPlan({
+  items,
+}: {
+  items: PlanItem[];
+}): ReactNode {
+  if (items.length === 0) {
+    return null;
   }
+  return (
+    <div className="stream-plan-block">
+      <div className="stream-plan-title">Plan</div>
+      <ul className="stream-plan-list">
+        {items.map((item, index) => {
+          const statusClass = `stream-plan-item-${item.status.replace(/\s+/g, "-")}`;
+          return (
+            <li
+              key={item.key || `${index}:${item.action}`}
+              className={`stream-plan-item ${statusClass}`}
+            >
+              <span className="stream-plan-action">{item.action}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+});
+
+function AssistantContent({
+  content,
+  planItems,
+}: {
+  content: string;
+  planItems: PlanItem[];
+}): ReactNode {
+  if (planItems.length === 0) {
+    return content ? (
+      <div className="message-copy markdown-content">
+        <MarkdownContent content={content} />
+      </div>
+    ) : null;
+  }
+
+  const { before, after, hasPlan } = splitAtPlan(content);
+  const beforeContent = hasPlan ? before : "";
+  const afterContent = hasPlan ? after : content;
 
   return (
     <>
-      {parsed.leadingMarkdown ? <MarkdownContent content={parsed.leadingMarkdown} /> : null}
-      <StreamingPlanList items={parsed.planItems} />
-      {parsed.trailingMarkdown ? <MarkdownContent content={parsed.trailingMarkdown} /> : null}
+      {beforeContent.trim() ? (
+        <div className="message-copy markdown-content">
+          <MarkdownContent content={beforeContent} />
+        </div>
+      ) : null}
+      <StreamingPlan items={planItems} />
+      {afterContent.trim() ? (
+        <div className="message-copy markdown-content">
+          <MarkdownContent content={afterContent} />
+        </div>
+      ) : null}
     </>
   );
 }
@@ -1300,19 +1489,28 @@ function StreamingDraftContent({ content }: { content: string }): ReactNode {
 const MessageRow = memo(function MessageRow({
   message,
   isArtifactPanelMessage,
+  isStreaming,
+  streamingStatus,
+  planItems,
   onOpenArtifactPanel,
 }: {
   message: ChatMessage;
   isArtifactPanelMessage: boolean;
+  isStreaming: boolean;
+  streamingStatus: string;
+  planItems: PlanItem[];
   onOpenArtifactPanel: (message: ChatMessage) => void;
 }): ReactNode {
+  const isAssistant = message.role === "assistant";
+  const rowClassName = isAssistant
+    ? isStreaming
+      ? "message-row assistant pending"
+      : "message-row assistant"
+    : "message-row user";
+
   return (
-    <article
-      className={
-        message.role === "user" ? "message-row user" : "message-row assistant"
-      }
-    >
-      {message.role === "assistant" ? (
+    <article className={rowClassName}>
+      {isAssistant ? (
         <div className="message-avatar">
           <AssistantAvatarIcon />
         </div>
@@ -1321,22 +1519,17 @@ const MessageRow = memo(function MessageRow({
       <div className="message-card">
         <div className="message-meta">
           <span>{messageAuthorLabel(message.role)}</span>
-          <span>{formatTime(message.created_at)}</span>
+          <span>{isStreaming ? "working" : formatTime(message.created_at)}</span>
         </div>
-        <div
-          className={
-            message.role === "assistant"
-              ? "message-copy markdown-content"
-              : "message-copy plain-text"
-          }
-        >
-          {message.role === "assistant" ? (
-            <MarkdownContent content={message.content} />
-          ) : (
-            message.content
-          )}
-        </div>
-        {message.role === "assistant" && message.artifacts.length > 0 ? (
+        {isStreaming && streamingStatus ? (
+          <div className="stream-status-line">{streamingStatus}</div>
+        ) : null}
+        {isAssistant ? (
+          <AssistantContent content={message.content} planItems={planItems} />
+        ) : (
+          <div className="message-copy plain-text">{message.content}</div>
+        )}
+        {isAssistant && message.artifacts.length > 0 ? (
           <div className="message-artifact-summary">
             <div className="message-artifact-summary-copy">
               <span className="message-artifact-summary-count">
@@ -1374,147 +1567,40 @@ const MessageRow = memo(function MessageRow({
 const MessageList = memo(function MessageList({
   messages,
   activeArtifactPanelMessageId,
+  streamingMessageId,
+  streamingStatus,
+  streamingPlanItems,
+  messagePlans,
   onOpenArtifactPanel,
 }: {
   messages: ChatMessage[];
   activeArtifactPanelMessageId: string | null;
+  streamingMessageId: string | null;
+  streamingStatus: string;
+  streamingPlanItems: PlanItem[];
+  messagePlans: Record<string, PlanItem[]>;
   onOpenArtifactPanel: (message: ChatMessage) => void;
 }): ReactNode {
   return (
     <>
-      {messages.map((message) => (
-        <MessageRow
-          key={message.id}
-          message={message}
-          isArtifactPanelMessage={activeArtifactPanelMessageId === message.id}
-          onOpenArtifactPanel={onOpenArtifactPanel}
-        />
-      ))}
-    </>
-  );
-});
-
-function parseStreamingDraft(value: string): ParsedStreamingDraft {
-  const planHeaderMatch = value.match(/(?:^|\n)(\*\*Plan\*\*|Plan)\s*(?:\n|$)/);
-  if (!planHeaderMatch || planHeaderMatch.index === undefined) {
-    return {
-      leadingMarkdown: value,
-      planItems: [],
-      trailingMarkdown: ""
-    };
-  }
-
-  const headerStart = planHeaderMatch.index + (planHeaderMatch[0].startsWith("\n") ? 1 : 0);
-  const headerEnd = headerStart + planHeaderMatch[1].length;
-  const leadingMarkdown = value.slice(0, headerStart).trim();
-  const afterHeader = value.slice(headerEnd).trimStart();
-  const lines = afterHeader.split(/\r?\n/);
-  const planItems: ParsedPlanItem[] = [];
-  const trailingLines: string[] = [];
-  let currentItemLines: string[] = [];
-  let planItemIndex = 0;
-  let parsingPlanItems = true;
-
-  for (const line of lines) {
-    const bulletMatch = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
-    if (parsingPlanItems && bulletMatch) {
-      if (currentItemLines.length > 0) {
-        const itemText = currentItemLines.join(" ").trim();
-        planItems.push(parsePlanItem(itemText, planItemIndex));
-        planItemIndex += 1;
-      }
-      currentItemLines = [bulletMatch[1].trim()];
-      continue;
-    }
-
-    if (parsingPlanItems && currentItemLines.length > 0 && line.trim()) {
-      currentItemLines.push(line.trim());
-      continue;
-    }
-
-    if (parsingPlanItems && currentItemLines.length > 0) {
-      const itemText = currentItemLines.join(" ").trim();
-      planItems.push(parsePlanItem(itemText, planItemIndex));
-      planItemIndex += 1;
-      currentItemLines = [];
-    }
-
-    parsingPlanItems = false;
-    trailingLines.push(line);
-  }
-
-  if (parsingPlanItems && currentItemLines.length > 0) {
-    const itemText = currentItemLines.join(" ").trim();
-    planItems.push(parsePlanItem(itemText, planItemIndex));
-  }
-
-  return {
-    leadingMarkdown,
-    planItems,
-    trailingMarkdown: trailingLines.join("\n").trim()
-  };
-}
-
-function parsePlanItem(value: string, index: number): ParsedPlanItem {
-  const match = value.match(/^(.*?)(?:\s+-\s+(not started|in progress|completed))$/i);
-  if (!match) {
-    return {
-      slotKey: `plan-item-${index}`,
-      actionText: value,
-      statusText: "",
-      rawText: value
-    };
-  }
-
-  return {
-    slotKey: `plan-item-${index}`,
-    actionText: match[1].trim(),
-    statusText: match[2],
-    rawText: value
-  };
-}
-
-const StreamingPlanList = memo(function StreamingPlanList({
-  items
-}: {
-  items: ParsedPlanItem[];
-}): ReactNode {
-  return (
-    <div className="stream-plan-block">
-      <div className="stream-plan-title">Plan</div>
-      <ul className="stream-plan-list">
-        {items.map((item) => (
-          <StreamingPlanRow
-            key={item.slotKey}
-            actionText={item.actionText}
-            statusText={item.statusText}
-            rawText={item.rawText}
+      {messages.map((message) => {
+        const isStreaming = message.id === streamingMessageId;
+        const planItems = isStreaming
+          ? streamingPlanItems
+          : messagePlans[message.id] ?? EMPTY_PLAN_ITEMS;
+        return (
+          <MessageRow
+            key={message.id}
+            message={message}
+            isArtifactPanelMessage={activeArtifactPanelMessageId === message.id}
+            isStreaming={isStreaming}
+            streamingStatus={isStreaming ? streamingStatus : ""}
+            planItems={planItems}
+            onOpenArtifactPanel={onOpenArtifactPanel}
           />
-        ))}
-      </ul>
-    </div>
-  );
-});
-
-const StreamingPlanRow = memo(function StreamingPlanRow({
-  actionText,
-  statusText,
-  rawText
-}: {
-  actionText: string;
-  statusText: string;
-  rawText: string;
-}): ReactNode {
-  if (!statusText) {
-    return <li className="stream-plan-item">{rawText}</li>;
-  }
-
-  return (
-    <li className="stream-plan-item">
-      <span className="stream-plan-action">{actionText}</span>
-      <span className="stream-plan-separator"> - </span>
-      <span className="stream-plan-status">{statusText}</span>
-    </li>
+        );
+      })}
+    </>
   );
 });
 

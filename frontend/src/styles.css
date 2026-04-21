@@ -1170,10 +1170,54 @@ body.artifact-panel-resizing {
 .stream-plan-list {
   margin: 0;
   padding-left: 1.2rem;
+  list-style: none;
+}
+
+.stream-plan-item {
+  position: relative;
+  padding-left: 1.2rem;
+  transition: color 120ms ease, opacity 120ms ease;
+}
+
+.stream-plan-item::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.55em;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.32);
+  transform: translateY(-50%);
 }
 
 .stream-plan-item + .stream-plan-item {
   margin-top: 0.2rem;
+}
+
+.stream-plan-item-not-started {
+  color: rgba(230, 236, 245, 0.65);
+}
+
+.stream-plan-item-in-progress {
+  color: #ffd28a;
+  font-weight: 600;
+}
+
+.stream-plan-item-in-progress::before {
+  border-color: #ffb560;
+  background: radial-gradient(circle, #ffb560 40%, rgba(255, 181, 96, 0.15) 70%);
+  box-shadow: 0 0 0 3px rgba(255, 181, 96, 0.18);
+}
+
+.stream-plan-item-completed {
+  color: rgba(230, 236, 245, 0.9);
+}
+
+.stream-plan-item-completed::before {
+  border-color: #4ade80;
+  background: #4ade80;
+  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.22);
 }
 
 .sr-only {
