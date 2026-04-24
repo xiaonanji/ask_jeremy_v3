@@ -154,6 +154,8 @@ async def connect_mcp_servers(
 
     try:
         from langchain_mcp_adapters.client import MultiServerMCPClient
+        import httpx
+        import ssl
     except ImportError:
         warnings.warn(
             "langchain-mcp-adapters is not installed; MCP servers will not be loaded. "
@@ -161,6 +163,25 @@ async def connect_mcp_servers(
             stacklevel=2,
         )
         return [], exit_stack
+
+    # Permanently monkey-patch httpx.AsyncClient to disable SSL verification
+    # This is needed for self-signed certificates (e.g., Tailscale servers)
+    # The patch persists for the lifetime of the application
+    if not hasattr(httpx.AsyncClient, '_ssl_patch_applied'):
+        original_async_client_init = httpx.AsyncClient.__init__
+
+        def patched_init(self, *args, **kwargs):
+            # If verify is not explicitly set, default to False for MCP connections
+            if 'verify' not in kwargs:
+                kwargs['verify'] = False
+            return original_async_client_init(self, *args, **kwargs)
+
+        httpx.AsyncClient.__init__ = patched_init
+        httpx.AsyncClient._ssl_patch_applied = True
+        warnings.warn(
+            "SSL verification disabled for httpx.AsyncClient to support self-signed certificates in MCP connections",
+            stacklevel=2,
+        )
 
     tools: list[BaseTool] = []
     for cfg in configs:
@@ -181,8 +202,10 @@ async def connect_mcp_servers(
             for tool in server_tools:
                 tools.append(McpToolProxy(inner=tool, server_name=cfg.name))
         except Exception as exc:
+            import traceback
             warnings.warn(
-                f"Failed to connect to MCP server '{cfg.name}' at {cfg.url}: {exc}",
+                f"Failed to connect to MCP server '{cfg.name}' at {cfg.url}: {exc}\n"
+                f"Full traceback:\n{traceback.format_exc()}",
                 stacklevel=2,
             )
 
