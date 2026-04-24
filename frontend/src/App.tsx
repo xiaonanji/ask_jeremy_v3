@@ -1185,6 +1185,13 @@ function formatArtifactCount(count: number): string {
 }
 
 function formatArtifactTypeLabel(artifact: ChatArtifact): string {
+  const extension = artifactExtension(artifact);
+  if (extension === "sql") {
+    return "sql";
+  }
+  if (extension === "py") {
+    return "python";
+  }
   const mediaType = artifact.mime_type?.toLowerCase() ?? "";
   if (mediaType.startsWith("image/")) {
     return "image";
@@ -1204,7 +1211,40 @@ function formatArtifactTypeLabel(artifact: ChatArtifact): string {
   if (mediaType.startsWith("text/")) {
     return "text";
   }
-  return artifact.filename.split(".").pop()?.toLowerCase() ?? "file";
+  return extension ?? "file";
+}
+
+function artifactExtension(artifact: ChatArtifact): string | null {
+  const parts = artifact.filename.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+  return parts.pop()?.toLowerCase() ?? null;
+}
+
+function isCodeArtifact(artifact: ChatArtifact): boolean {
+  const extension = artifactExtension(artifact);
+  if (extension === "sql" || extension === "py") {
+    return true;
+  }
+  const mediaType = artifact.mime_type?.toLowerCase() ?? "";
+  return (
+    mediaType === "application/sql" ||
+    mediaType === "application/x-python" ||
+    mediaType === "text/x-python" ||
+    mediaType === "text/x-sql"
+  );
+}
+
+function codeLanguageFromArtifact(artifact: ChatArtifact): string {
+  const extension = artifactExtension(artifact);
+  if (extension === "py") {
+    return "python";
+  }
+  if (extension === "sql") {
+    return "sql";
+  }
+  return "text";
 }
 
 function clampArtifactPanelWidth(width: number): number {
@@ -1398,6 +1438,17 @@ function ArtifactPreview({
   sessionId: string;
 }): ReactNode {
   const previewUrl = artifactUrl(sessionId, artifact.relative_path);
+
+  if (isCodeArtifact(artifact)) {
+    return (
+      <CodeArtifactPreview
+        url={previewUrl}
+        filename={artifact.filename}
+        language={codeLanguageFromArtifact(artifact)}
+      />
+    );
+  }
+
   if (artifact.mime_type?.startsWith("image/")) {
     return <img className="artifact-preview-image" src={previewUrl} alt={artifact.filename} />;
   }
@@ -1418,6 +1469,103 @@ function ArtifactPreview({
       <a href={previewUrl} target="_blank" rel="noreferrer">
         Open in new tab
       </a>
+    </div>
+  );
+}
+
+function CodeArtifactPreview({
+  url,
+  filename,
+  language,
+}: {
+  url: string;
+  filename: string;
+  language: string;
+}): ReactNode {
+  const [state, setState] = useState<
+    | { status: "loading" }
+    | { status: "ready"; text: string }
+    | { status: "error"; message: string }
+  >({ status: "loading" });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ status: "loading" });
+    fetch(url)
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load code (${response.status})`);
+        }
+        return response.text();
+      })
+      .then((text) => {
+        if (!cancelled) {
+          setState({ status: "ready", text });
+        }
+      })
+      .catch((caughtError) => {
+        if (!cancelled) {
+          setState({
+            status: "error",
+            message:
+              caughtError instanceof Error
+                ? caughtError.message
+                : "Unknown error",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
+  if (state.status === "loading") {
+    return (
+      <div className="artifact-code-block">
+        <div className="artifact-code-header">
+          <span className="artifact-code-language">{language}</span>
+          <span className="artifact-code-filename">{filename}</span>
+        </div>
+        <div className="artifact-preview-empty">Loading code…</div>
+      </div>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <div className="artifact-code-block">
+        <div className="artifact-code-header">
+          <span className="artifact-code-language">{language}</span>
+          <span className="artifact-code-filename">{filename}</span>
+        </div>
+        <div className="artifact-preview-empty">
+          <span>Could not load code: {state.message}</span>
+          <a href={url} target="_blank" rel="noreferrer">
+            Open in new tab
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  const lines = state.text.split(/\r?\n/);
+  return (
+    <div className="artifact-code-block">
+      <div className="artifact-code-header">
+        <span className="artifact-code-language">{language}</span>
+        <span className="artifact-code-filename">{filename}</span>
+      </div>
+      <pre className={`artifact-code-pre language-${language}`}>
+        <code>
+          {lines.map((line, index) => (
+            <span key={index} className="artifact-code-line">
+              <span className="artifact-code-line-number">{index + 1}</span>
+              <span className="artifact-code-line-text">{line || " "}</span>
+            </span>
+          ))}
+        </code>
+      </pre>
     </div>
   );
 }

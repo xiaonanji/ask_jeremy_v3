@@ -103,8 +103,17 @@ class LocalToolRegistry:
                 )
             artifact_root = session_artifact_root(settings.session_root, session_id)
             before_snapshot = snapshot_artifacts(artifact_root)
+            script_path = _write_python_code_artifact(
+                artifact_root=artifact_root,
+                script=script,
+            )
+            run_args = (
+                [sys.executable, str(script_path)]
+                if script_path is not None
+                else [sys.executable, "-c", script]
+            )
             result = _run_process(
-                args=[sys.executable, "-c", script],
+                args=run_args,
                 settings=settings,
                 workdir=workdir,
                 timeout_seconds=timeout_seconds,
@@ -234,6 +243,14 @@ class LocalToolRegistry:
             stdout_path = analysis_dir / "stdout.txt"
             stderr_path = analysis_dir / "stderr.txt"
             script_path.write_text(script, encoding="utf-8")
+            _write_python_code_artifact(
+                artifact_root=artifact_root,
+                script=script,
+                filename=f"{analysis_id}.py",
+                header=(
+                    f"# Analysis {analysis_id} run against SQL artifact {raw_artifact_id}\n\n"
+                ),
+            )
 
             result = _run_process(
                 args=[sys.executable, str(script_path)],
@@ -373,6 +390,26 @@ class LocalToolRegistry:
             run_analysis_script,
             read_analysis_result,
         ]
+
+
+def _write_python_code_artifact(
+    *,
+    artifact_root: Path | None,
+    script: str,
+    filename: str | None = None,
+    header: str | None = None,
+) -> Path | None:
+    if artifact_root is None:
+        return None
+    code_dir = artifact_root / "code" / "python"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    if filename is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"script_{stamp}_{os.urandom(4).hex()}.py"
+    target = code_dir / filename
+    body = script if not header else f"{header}{script}"
+    target.write_text(body, encoding="utf-8")
+    return target
 
 
 def _run_process(

@@ -5,6 +5,7 @@ from mimetypes import guess_type
 from pathlib import Path
 
 _INTERNAL_ARTIFACT_PREFIXES = ("sql/", "analysis/")
+_ALWAYS_VISIBLE_ARTIFACT_PREFIXES = ("code/",)
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,8 @@ def collect_artifacts(
 
 def is_user_visible_artifact(relative_path: str) -> bool:
     normalized = relative_path.replace("\\", "/").lstrip("./")
+    if any(normalized.startswith(prefix) for prefix in _ALWAYS_VISIBLE_ARTIFACT_PREFIXES):
+        return True
     if normalized == "sql":
         return False
     return not any(normalized.startswith(prefix) for prefix in _INTERNAL_ARTIFACT_PREFIXES)

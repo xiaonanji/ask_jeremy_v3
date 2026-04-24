@@ -367,6 +367,7 @@ class LangGraphChatClient:
             context.max_history_messages,
         )
 
+        database_display = _database_display_name(context.database_backend)
         prompt = [
             SystemMessage(
                 content=(
@@ -377,9 +378,14 @@ class LangGraphChatClient:
                     f"Conversation session id: {context.session_id}\n"
                     f"Session workspace: {context.workspace_path}\n"
                     f"Session artifacts: {context.artifacts_path}\n"
-                    f"Session database backend: {context.database_backend}\n"
                     f"Project root: {context.project_root}\n"
-                    f"Configured PERSON_WIKI_ROOT: {context.person_wiki_root or 'not configured'}"
+                    f"Configured PERSON_WIKI_ROOT: {context.person_wiki_root or 'not configured'}\n\n"
+                    "=== ACTIVE SQL DATABASE ===\n"
+                    f"This session's `execute_sql_query` tool runs queries against: {database_display}.\n"
+                    f"Every SQL statement you produce MUST be valid {database_display} syntax.\n"
+                    f"Do not mix in syntax from other SQL dialects. If you are unsure whether a "
+                    f"function or clause exists in {database_display}, use a form you are confident "
+                    f"is supported there, or consult {database_display} documentation conventions."
                 )
             ),
             *self._skill_prompt_messages(state),
@@ -797,6 +803,15 @@ class LangGraphChatClient:
 
 def build_chat_client(settings: Settings) -> LangGraphChatClient:
     return LangGraphChatClient(settings)
+
+
+def _database_display_name(backend: DatabaseBackend) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized == "sqlite":
+        return "SQLite"
+    if normalized == "snowflake":
+        return "Snowflake"
+    return str(backend)
 
 
 def _trim_message_history(

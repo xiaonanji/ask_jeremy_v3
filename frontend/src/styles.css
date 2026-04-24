@@ -1144,6 +1144,79 @@ body.artifact-panel-resizing {
   color: #8dc2ff;
 }
 
+.artifact-code-block {
+  display: flex;
+  flex-direction: column;
+  min-height: 20rem;
+  max-height: 38rem;
+  background: #0a0e14;
+}
+
+.artifact-code-header {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.artifact-code-language {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: #8dc2ff;
+}
+
+.artifact-code-filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.artifact-code-pre {
+  flex: 1;
+  margin: 0;
+  padding: 0.75rem 0;
+  overflow: auto;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: #d8e4f0;
+  background: #0a0e14;
+}
+
+.artifact-code-pre code {
+  display: block;
+  min-width: fit-content;
+}
+
+.artifact-code-line {
+  display: grid;
+  grid-template-columns: 3rem 1fr;
+  align-items: baseline;
+}
+
+.artifact-code-line-number {
+  text-align: right;
+  padding-right: 0.85rem;
+  color: var(--text-muted);
+  user-select: none;
+  opacity: 0.6;
+}
+
+.artifact-code-line-text {
+  white-space: pre;
+  padding-right: 0.9rem;
+}
+
 .stream-status-list {
   display: grid;
   gap: 0.4rem;

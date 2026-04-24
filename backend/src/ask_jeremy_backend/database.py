@@ -86,6 +86,13 @@ class SqlQueryExecutor:
         }
         self._write_json(json_path, payload)
         self._write_csv(csv_path, columns, rows)
+        self._write_sql_code_artifact(
+            session_id=session_id,
+            artifact_id=artifact_dir.name,
+            database=normalized_database,
+            created_at=created_at,
+            executed_query=executed_query,
+        )
 
         return QueryArtifact(
             artifact_id=artifact_dir.name,
@@ -216,6 +223,24 @@ class SqlQueryExecutor:
             "network_timeout": self.settings.sql_query_timeout_seconds,
             "session_parameters": {"QUERY_TAG": _QUERY_TAG},
         }
+
+    def _write_sql_code_artifact(
+        self,
+        *,
+        session_id: str,
+        artifact_id: str,
+        database: DatabaseBackend,
+        created_at: datetime,
+        executed_query: str,
+    ) -> None:
+        code_dir = self.settings.session_root / session_id / "artifacts" / "code" / "sql"
+        code_dir.mkdir(parents=True, exist_ok=True)
+        sql_path = code_dir / f"{artifact_id}.sql"
+        header = (
+            f"-- Executed {created_at.isoformat()} against {database}\n"
+            f"-- Artifact: {artifact_id}\n\n"
+        )
+        sql_path.write_text(header + executed_query.rstrip() + "\n", encoding="utf-8")
 
     def _artifact_dir_for(
         self,
