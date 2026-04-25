@@ -3,6 +3,12 @@
     "name": "mempalace",
     "url": "https://seans-mac-mini.tail28f51a.ts.net/mcp",
     "bearer_token": "${MEMPALACE_MCP_TOKEN}",
+    "enabled": false
+  },
+  {
+    "name": "mem0",
+    "url": "https://mem0.seanji.net/mcp",
+    "bearer_token": "${MEM0_MCP_TOKEN}",
     "enabled": true
   }
 ]

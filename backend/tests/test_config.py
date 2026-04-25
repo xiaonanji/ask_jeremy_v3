@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ask_jeremy_backend.config import DEFAULT_SYSTEM_PROMPT, Settings
+from ask_jeremy_backend.config import Settings
 
 
 class SettingsPromptTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class SettingsPromptTests(unittest.TestCase):
 
             self.assertEqual(settings.resolved_system_prompt, "Prompt from env")
 
-    def test_resolved_system_prompt_falls_back_when_file_is_missing(self) -> None:
+    def test_resolved_system_prompt_raises_when_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
 
@@ -44,7 +44,8 @@ class SettingsPromptTests(unittest.TestCase):
                 project_root=root,
             )
 
-            self.assertEqual(settings.resolved_system_prompt, DEFAULT_SYSTEM_PROMPT)
+            with self.assertRaises(FileNotFoundError):
+                settings.resolved_system_prompt
 
     def test_relative_jeremy_prompt_path_is_resolved_from_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
