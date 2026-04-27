@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "mcp__mempalace__mempalace_search"
+      "mcp__mempalace__mempalace_search",
+      "Bash(pip show:*)",
+      "Bash(findstr:*)"
     ]
   }
 }

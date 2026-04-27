@@ -322,9 +322,20 @@ def _sanitize_query(query: str) -> str:
         )
 
     lowered = statement_without_comments.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
+    _ALLOWED_PREFIXES = (
+        "select",
+        "with",
+        "show",
+        "desc",
+        "describe",
+        "explain",
+        "list",
+    )
+    if not any(lowered.startswith(prefix) for prefix in _ALLOWED_PREFIXES):
         raise QueryValidationError(
-            "Only read-only SELECT statements are allowed."
+            "Only read-only statements are allowed (SELECT, WITH, SHOW, "
+            "DESCRIBE, EXPLAIN, LIST). Data-modifying statements (INSERT, "
+            "UPDATE, DELETE, DROP, ALTER, etc.) are prohibited."
         )
 
     return statement_without_comments

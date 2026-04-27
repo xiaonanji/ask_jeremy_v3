@@ -33,10 +33,13 @@ class SkillActivationManager:
         return hydrated
 
     def _activate(self, skill: SkillDefinition) -> ActivatedSkill:
+        instructions = skill.instructions
+        for relative, absolute in skill.reference_path_map.items():
+            instructions = instructions.replace(relative, absolute)
         return ActivatedSkill(
             id=skill.id,
             name=skill.name,
             scope=skill.scope,
             trusted=skill.trusted,
-            instructions=skill.instructions,
+            instructions=instructions,
         )

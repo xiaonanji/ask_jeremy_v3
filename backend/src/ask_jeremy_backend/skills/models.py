@@ -25,6 +25,7 @@ class SkillDefinition:
     skill_file: Path
     instructions: str
     references: tuple[Path, ...] = field(default_factory=tuple)
+    reference_path_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

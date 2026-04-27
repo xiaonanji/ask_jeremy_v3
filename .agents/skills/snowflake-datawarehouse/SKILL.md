@@ -17,20 +17,26 @@ It returns a table containing the following key columns:
 - null?: whether the column can contain null values
 - comment: the descriptions of the column
 
+The comment column is particularly useful as it provides the business meaning of the column, which can help analysts understand how to use the column in their analysis.
+
+Also notice that some table reference markdown file also provides a Table Schema section. If the comment column in the table schema returned by the DESC TABLE command is not descriptive enough, you can refer to the Table Schema section in the reference markdown file for more detailed descriptions of the columns.
+
 ---
 
 ## Key Tables in the Data Warehouse
+
+Note that for each table below, there is a reference markdown file that provides more detailed information about the table, including its schema, key columns, and example queries. You should dynamically refer to the needed markdown files for a deeper understanding of the target table and how to use it effectively in your analysis.
 
 ### dim_underwriting_bank_model_validation
 - Full name: `prod_analytics.prod_prep.dim_underwriting_bank_model_validation`
 - Description: This table contains the bank score model output and related features used for origination and limit increase applications. It includes the latest bank score, the legacy bank score, and key features used in the 2022 bank score model.
 - Reference: `references/dim_underwriting_bank_model_validation.md`
 
-### zm_cli_daily_monitoring_reporting
-- Full name: `prod_analytics.prod_mart.zm_cli_daily_monitoring_reporting`
-- Description: This table contains each credit limit increase application as a record, with key information such as consumer_id, application_id, product, submission_time, and the latest bank score.
+### cli_daily_monitoring_reporting
+- Full name: `prod_analytics.prod_mart.cli_daily_monitoring_reporting`
+- Description: This table contains records per credit limit increase application per rule.
 - Best for: Monitoring credit limit increase applications, generating monitoring reports and key metrics, and analyzing application trends.
-- Reference: `references/zm_cli_daily_monitoring_reporting.md`
+- Reference: `references/cli_daily_monitoring_reporting.md`
 
 ### fct_repayment_request
 - Full name: `prod_analytics.prod_prep.fct_repayment_request`

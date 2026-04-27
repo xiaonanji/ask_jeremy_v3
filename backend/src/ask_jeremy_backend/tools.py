@@ -138,7 +138,7 @@ class LocalToolRegistry:
         def execute_sql_query(
             query: str,
         ) -> str:
-            """Execute a read-only SQL query against the configured session database and save the raw result set as an internal artifact. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
+            """Execute a read-only SQL statement against the configured session database and save the raw result set as an internal artifact. Allowed statements: SELECT, WITH (CTEs), SHOW, DESCRIBE/DESC, EXPLAIN, LIST. Data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are prohibited. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
             session_id = _session_id()
             if not session_id:
                 return json.dumps(
@@ -383,12 +383,87 @@ class LocalToolRegistry:
                 indent=2,
             )
 
+        @tool
+        def load_skill_reference(
+            file_path: str,
+        ) -> str:
+            """Load the content of a skill reference file given its absolute path. Use this to read detailed documentation, schema descriptions, or other reference materials mentioned in activated skill instructions. The file must be located within a recognised skill directory."""
+            target = Path(file_path).resolve()
+
+            allowed_roots = [
+                settings.project_skill_root.resolve(),
+                settings.user_skill_root.resolve(),
+            ]
+            if not any(
+                target == root or target.is_relative_to(root)
+                for root in allowed_roots
+                if root.exists()
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error_type": "permission_error",
+                        "message": f"Path is not within a recognised skill directory: {file_path}",
+                    },
+                    indent=2,
+                )
+
+            if not target.exists():
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error_type": "file_not_found",
+                        "message": f"File does not exist: {file_path}",
+                    },
+                    indent=2,
+                )
+
+            if not target.is_file():
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error_type": "invalid_path",
+                        "message": f"Path is not a file: {file_path}",
+                    },
+                    indent=2,
+                )
+
+            try:
+                content = target.read_text(encoding="utf-8")
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error_type": "read_error",
+                        "message": str(exc),
+                    },
+                    indent=2,
+                )
+
+            max_chars = 50_000
+            truncated = len(content) > max_chars
+            if truncated:
+                content = content[:max_chars]
+
+            suffix = " (truncated)" if truncated else ""
+            return json.dumps(
+                {
+                    "ok": True,
+                    "message": f"Loaded {len(content)} chars from {target.name}{suffix}",
+                    "file_path": str(target),
+                    "content": content,
+                    "truncated": truncated,
+                },
+                indent=2,
+            )
+
         return [
             run_shell_command,
             run_python_script,
             execute_sql_query,
             run_analysis_script,
             read_analysis_result,
+            load_skill_reference,
         ]
 
 

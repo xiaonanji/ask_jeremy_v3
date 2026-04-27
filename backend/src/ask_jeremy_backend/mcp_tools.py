@@ -92,6 +92,13 @@ def set_mcp_event_emitter(emitter: Any) -> None:
     _mcp_event_local.emitter = emitter
 
 
+def emit_custom_event(event: dict) -> None:
+    """Emit an arbitrary event dict through the thread-local SSE emitter."""
+    emitter = getattr(_mcp_event_local, "emitter", None)
+    if emitter is not None:
+        emitter(event)
+
+
 def _emit_mcp_event(server_name: str, tool_name: str) -> None:
     emitter = getattr(_mcp_event_local, "emitter", None)
     if emitter is not None:
@@ -178,10 +185,6 @@ async def connect_mcp_servers(
 
         httpx.AsyncClient.__init__ = patched_init
         httpx.AsyncClient._ssl_patch_applied = True
-        warnings.warn(
-            "SSL verification disabled for httpx.AsyncClient to support self-signed certificates in MCP connections",
-            stacklevel=2,
-        )
 
     tools: list[BaseTool] = []
     for cfg in configs:

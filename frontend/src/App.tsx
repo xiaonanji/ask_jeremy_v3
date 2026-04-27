@@ -98,11 +98,16 @@ const PLAN_HEADER_PATTERN =
 const PLAN_ITEM_PATTERN =
   /^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*(?:[-–—]|\||\()\s*(not started|in progress|completed)\s*\)?\s*$/i;
 
-type ArtifactPanelState = {
-  messageId: string;
-  messageCreatedAt: string;
-  artifacts: ChatArtifact[];
-};
+type LogEntryBase = { id: string; timestamp: number };
+
+type LogEntry =
+  | LogEntryBase & { kind: "reasoning"; content: string }
+  | LogEntryBase & { kind: "node_lifecycle"; nodeName: string; phase: "started" | "finished"; error: string | null; details: Record<string, unknown> }
+  | LogEntryBase & { kind: "mcp_tool_call"; serverName: string; toolName: string };
+
+type RightPanelState =
+  | { mode: "artifacts"; messageId: string; messageCreatedAt: string; artifacts: ChatArtifact[] }
+  | { mode: "logs"; messageId: string };
 
 type ArtifactPanelResizeState = {
   startX: number;
@@ -129,12 +134,16 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState<StreamingState | null>(null);
   const [messagePlans, setMessagePlans] = useState<Record<string, PlanItem[]>>({});
-  const [artifactPanel, setArtifactPanel] = useState<ArtifactPanelState | null>(null);
+  const [rightPanel, setRightPanel] = useState<RightPanelState | null>(null);
+  const [messageLogs, setMessageLogs] = useState<Record<string, LogEntry[]>>({});
   const [isSessionRailCollapsed, setIsSessionRailCollapsed] = useState(false);
   const [artifactPanelWidth, setArtifactPanelWidth] = useState(DEFAULT_ARTIFACT_PANEL_WIDTH);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const artifactPanelResizeRef = useRef<ArtifactPanelResizeState | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  const isRightPanelOpen = rightPanel !== null;
 
   useEffect(() => {
     void bootstrap();
@@ -193,7 +202,8 @@ export default function App() {
     setIsBootstrapping(true);
     setStreaming(null);
     setMessagePlans({});
-    setArtifactPanel(null);
+    setRightPanel(null);
+    setMessageLogs({});
     setError(null);
     try {
       const [sessionList, catalog] = await Promise.all([
@@ -229,7 +239,8 @@ export default function App() {
   async function handleSelectSession(sessionId: string): Promise<void> {
     setStreaming(null);
     setMessagePlans({});
-    setArtifactPanel(null);
+    setRightPanel(null);
+    setMessageLogs({});
     setError(null);
     try {
       const detail = await fetchSession(sessionId);
@@ -242,7 +253,8 @@ export default function App() {
   async function handleNewChat(): Promise<void> {
     setStreaming(null);
     setMessagePlans({});
-    setArtifactPanel(null);
+    setRightPanel(null);
+    setMessageLogs({});
     setError(null);
     try {
       const created = await createDefaultSession();
@@ -273,15 +285,20 @@ export default function App() {
       return;
     }
 
-    setArtifactPanel({
+    setRightPanel({
+      mode: "artifacts",
       messageId: message.id,
       messageCreatedAt: message.created_at,
       artifacts: message.artifacts,
     });
   }
 
-  function handleCloseArtifactPanel(): void {
-    setArtifactPanel(null);
+  function handleCloseRightPanel(): void {
+    setRightPanel(null);
+  }
+
+  function handleOpenLogPanel(messageId: string): void {
+    setRightPanel({ mode: "logs", messageId });
   }
 
   function handleToggleSessionRail(): void {
@@ -435,6 +452,8 @@ export default function App() {
     setDraft("");
     setIsSending(true);
     setError(null);
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
 
     const optimisticUserMessage: ChatMessage = {
       id: `local-user-${crypto.randomUUID()}`,
@@ -470,7 +489,18 @@ export default function App() {
     });
 
     let accumulatedContent = "";
+    let activatedSkillNames: string[] = [];
     let currentPlanItems: PlanItem[] = [];
+    let currentLogEntries: LogEntry[] = [];
+    let logSeq = 0;
+
+    function pushLogEntry(entry: Omit<LogEntry, "id" | "timestamp">): void {
+      logSeq += 1;
+      const full = { ...entry, id: `log-${logSeq}`, timestamp: Date.now() } as LogEntry;
+      currentLogEntries = [...currentLogEntries, full];
+      const snapshot = currentLogEntries;
+      setMessageLogs((prev) => ({ ...prev, [optimisticAssistantMessage.id]: snapshot }));
+    }
 
     const updateOptimisticAssistant = (
       updater: (message: ChatMessage) => ChatMessage
@@ -521,6 +551,10 @@ export default function App() {
 
         if (eventName === "task_started") {
           const taskName = String((payload as { name?: unknown }).name ?? "");
+          // Capture intermediate reasoning before call_model resets content
+          if (taskName === "call_model" && accumulatedContent.trim()) {
+            pushLogEntry({ kind: "reasoning", content: accumulatedContent.trim() });
+          }
           // Each call_model invocation is a fresh generation — drop any
           // pre-tool-call draft so the streamed text matches the final reply.
           // Plan items persist across resets so their in-place status updates.
@@ -528,6 +562,7 @@ export default function App() {
             accumulatedContent = "";
             updateOptimisticAssistant((message) => ({ ...message, content: "" }));
           }
+          pushLogEntry({ kind: "node_lifecycle", nodeName: taskName, phase: "started", error: null, details: {} });
           setStreamingStatus(describeTaskStatus(taskName, "started"));
           return;
         }
@@ -535,20 +570,43 @@ export default function App() {
         if (eventName === "task_finished") {
           const taskName = String((payload as { name?: unknown }).name ?? "");
           const errorMessage = (payload as { error?: unknown }).error;
-          setStreamingStatus(
-            describeTaskStatus(
-              taskName,
-              "finished",
-              typeof errorMessage === "string" ? errorMessage : null
-            )
-          );
+          const errorStr = typeof errorMessage === "string" ? errorMessage : null;
+          const taskDetails = (payload as { details?: Record<string, unknown> }).details ?? {};
+          pushLogEntry({ kind: "node_lifecycle", nodeName: taskName, phase: "finished", error: errorStr, details: taskDetails });
+          let status = describeTaskStatus(taskName, "finished", errorStr);
+          if (taskName.trim().toLowerCase() === "select_skills" && activatedSkillNames.length > 0) {
+            status = `Context loaded: ${activatedSkillNames.join(", ")}`;
+          }
+          setStreamingStatus(status);
+          return;
+        }
+
+        if (eventName === "tool_call") {
+          return;
+        }
+
+        if (eventName === "tool_result") {
           return;
         }
 
         if (eventName === "mcp_tool_call") {
           const serverName = String((payload as { server_name?: unknown }).server_name ?? "");
           const toolName = String((payload as { tool_name?: unknown }).tool_name ?? "");
+          pushLogEntry({ kind: "mcp_tool_call", serverName, toolName });
           setStreamingStatus(`MCP: ${serverName} \u2192 ${toolName}`);
+          return;
+        }
+
+        if (eventName === "skills_activated") {
+          const p = payload as {
+            names?: string[];
+            skills?: { name: string; path?: string; description?: string; scope?: string }[];
+          };
+          const names = p.names ?? [];
+          activatedSkillNames = names;
+          if (names.length > 0) {
+            setStreamingStatus(`Skills loaded: ${names.join(", ")}`);
+          }
           return;
         }
 
@@ -562,6 +620,11 @@ export default function App() {
 
         if (eventName !== "done") {
           return;
+        }
+
+        // Capture final reasoning text
+        if (accumulatedContent.trim()) {
+          pushLogEntry({ kind: "reasoning", content: accumulatedContent.trim() });
         }
 
         didComplete = true;
@@ -619,15 +682,56 @@ export default function App() {
             )
         );
         setStreaming(null);
-      });
+      }, abortController.signal);
 
-      if (!didComplete) {
+      if (!didComplete && !abortController.signal.aborted) {
         if (streamErrorMessage) {
           throw new Error(streamErrorMessage);
         }
         throw new Error("The message stream ended before completion.");
       }
+
+      // User-initiated cancel: keep partial response visible, refresh session
+      if (abortController.signal.aborted) {
+        try {
+          const detail = await fetchSession(sessionId);
+          setActiveSession((current) => {
+            if (!current) return current;
+            // Preserve the partial assistant content already shown
+            const partialContent = accumulatedContent;
+            return {
+              session: detail.session,
+              messages: current.messages.map((message) => {
+                if (message.id === optimisticUserMessage.id) {
+                  // Try to find the server-saved user message
+                  const serverUser = detail.messages.find((m) => m.role === "user" && m.content === content);
+                  return serverUser ? { ...serverUser, id: message.id } : message;
+                }
+                if (message.id === optimisticAssistantMessage.id) {
+                  return { ...message, content: partialContent || message.content };
+                }
+                return message;
+              }),
+            };
+          });
+          setSessions((current) =>
+            current
+              .map((session) =>
+                session.id === detail.session.id ? detail.session : session
+              )
+              .sort((left, right) =>
+                right.updated_at.localeCompare(left.updated_at)
+              )
+          );
+        } catch {
+          // Session refresh failed — keep whatever we have
+        }
+      }
     } catch (caughtError) {
+      if (abortController.signal.aborted) {
+        // User cancelled — not an error
+        return;
+      }
       setDraft(content);
       try {
         const detail = await fetchSession(sessionId);
@@ -657,6 +761,7 @@ export default function App() {
       }
       setError(caughtError instanceof Error ? caughtError.message : "Unknown error");
     } finally {
+      streamAbortRef.current = null;
       setStreaming(null);
       setIsSending(false);
     }
@@ -671,12 +776,16 @@ export default function App() {
     );
   }
 
+  function handleCancel(): void {
+    streamAbortRef.current?.abort();
+  }
+
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
     if (event.key !== "Enter") {
       return;
     }
 
-    if (event.ctrlKey) {
+    if (event.shiftKey) {
       return;
     }
 
@@ -899,7 +1008,14 @@ export default function App() {
         ) : null}
       </aside>
 
-      <main className={artifactPanel ? "chat-panel artifact-panel-open" : "chat-panel"}>
+      <main
+        className={isRightPanelOpen ? "chat-panel artifact-panel-open" : "chat-panel"}
+        style={
+          isRightPanelOpen
+            ? ({ "--artifact-panel-width": `${artifactPanelWidth}px` } as CSSProperties)
+            : undefined
+        }
+      >
         <header className="chat-header">
           <div className="chat-header-inner">
             <div className="chat-title-block">
@@ -968,14 +1084,7 @@ export default function App() {
           </div>
         </header>
 
-        <div
-          className="chat-body"
-          style={
-            artifactPanel
-              ? ({ "--artifact-panel-width": `${artifactPanelWidth}px` } as CSSProperties)
-              : undefined
-          }
-        >
+        <div className="chat-body">
           <div className="chat-column">
             <section className="chat-feed">
               <div className="chat-feed-inner">
@@ -1025,12 +1134,15 @@ export default function App() {
             {activeSession ? (
               <MessageList
                 messages={activeSession.messages}
-                activeArtifactPanelMessageId={artifactPanel?.messageId ?? null}
+                activeArtifactPanelMessageId={rightPanel?.messageId ?? null}
+                activeLogPanelMessageId={rightPanel?.mode === "logs" ? rightPanel.messageId : null}
                 streamingMessageId={streaming?.assistantMessageId ?? null}
                 streamingStatus={streaming?.statusLine ?? ""}
                 streamingPlanItems={streaming?.planItems ?? EMPTY_PLAN_ITEMS}
                 messagePlans={messagePlans}
+                messageLogs={messageLogs}
                 onOpenArtifactPanel={handleOpenArtifactPanel}
+                onOpenLogPanel={handleOpenLogPanel}
               />
             ) : null}
 
@@ -1051,6 +1163,9 @@ export default function App() {
                         <span className="composer-status-dot composer-status-dot-3">.</span>
                       </span>
                     </span>
+                    <button type="button" className="composer-stop-button" onClick={handleCancel}>
+                      <StopIcon /> Stop
+                    </button>
                   </div>
                 ) : null}
 
@@ -1065,7 +1180,7 @@ export default function App() {
                   />
 
                   <div className="composer-footer">
-                    <div className="composer-hint">Enter to send, Ctrl+Enter for a new line</div>
+                    <div className="composer-hint">Enter to send, Shift+Enter for a new line</div>
                     <button type="submit" disabled={!draft.trim() || isSending || !activeSession}>
                       Send message
                     </button>
@@ -1075,68 +1190,82 @@ export default function App() {
             </footer>
           </div>
 
-          {artifactPanel && activeSession ? (
-            <aside className="artifact-panel" aria-label="Artifact viewer">
+          {isRightPanelOpen && activeSession ? (
+            <aside
+              className="artifact-panel"
+              aria-label={rightPanel.mode === "logs" ? "Agent log" : "Artifact viewer"}
+            >
               <div
                 className="artifact-panel-resizer"
                 onMouseDown={handleStartArtifactResize}
                 role="separator"
                 aria-orientation="vertical"
-                aria-label="Resize artifact panel"
+                aria-label="Resize panel"
               />
-              <div className="artifact-panel-header">
-                <div>
-                  <p className="artifact-panel-kicker">Artifacts</p>
-                  <h3>{formatArtifactCount(artifactPanel.artifacts.length)}</h3>
-                  <p className="artifact-panel-subtitle">
-                    Response at {formatTime(artifactPanel.messageCreatedAt)}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="artifact-panel-close"
-                  onClick={handleCloseArtifactPanel}
-                >
-                  Close
-                </button>
-              </div>
-
-              <div className="artifact-preview-shell">
-                {artifactPanel.artifacts.length > 0 ? (
-                  <div className="artifact-preview-stack">
-                    {artifactPanel.artifacts.map((artifact) => (
-                      <section
-                        key={artifact.relative_path}
-                        className="artifact-preview-card"
-                      >
-                        <div className="artifact-preview-toolbar">
-                          <div className="artifact-preview-title">
-                            <strong>{artifact.filename}</strong>
-                            <span>{formatArtifactTypeLabel(artifact)}</span>
-                          </div>
-                          <a
-                            className="artifact-preview-link"
-                            href={artifactUrl(activeSession.session.id, artifact.relative_path)}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            Open in new tab
-                          </a>
-                        </div>
-
-                        <div className="artifact-preview-surface">
-                          <ArtifactPreview
-                            artifact={artifact}
-                            sessionId={activeSession.session.id}
-                          />
-                        </div>
-                      </section>
-                    ))}
+              {rightPanel.mode === "artifacts" ? (
+                <>
+                  <div className="artifact-panel-header">
+                    <div>
+                      <p className="artifact-panel-kicker">Artifacts</p>
+                      <h3>{formatArtifactCount(rightPanel.artifacts.length)}</h3>
+                      <p className="artifact-panel-subtitle">
+                        Response at {formatTime(rightPanel.messageCreatedAt)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="artifact-panel-close"
+                      onClick={handleCloseRightPanel}
+                    >
+                      Close
+                    </button>
                   </div>
-                ) : (
-                  <div className="artifact-preview-empty">Select an artifact to preview.</div>
-                )}
-              </div>
+
+                  <div className="artifact-preview-shell">
+                    {rightPanel.artifacts.length > 0 ? (
+                      <div className="artifact-preview-stack">
+                        {rightPanel.artifacts.map((artifact) => (
+                          <section
+                            key={artifact.relative_path}
+                            className="artifact-preview-card"
+                          >
+                            <div className="artifact-preview-toolbar">
+                              <div className="artifact-preview-title">
+                                <strong>{artifact.filename}</strong>
+                                <span>{formatArtifactTypeLabel(artifact)}</span>
+                              </div>
+                              <a
+                                className="artifact-preview-link"
+                                href={artifactUrl(activeSession.session.id, artifact.relative_path)}
+                                target="_blank"
+                                rel="noreferrer"
+                                title="Open in new tab"
+                              >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" /></svg>
+                              </a>
+                            </div>
+
+                            <div className="artifact-preview-surface">
+                              <ArtifactPreview
+                                artifact={artifact}
+                                sessionId={activeSession.session.id}
+                              />
+                            </div>
+                          </section>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="artifact-preview-empty">Select an artifact to preview.</div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <LogPanel
+                  messageId={rightPanel.messageId}
+                  entries={messageLogs[rightPanel.messageId] ?? []}
+                  onClose={handleCloseRightPanel}
+                />
+              )}
             </aside>
           ) : null}
         </div>
@@ -1173,6 +1302,12 @@ function describeTaskStatus(
 
   if (normalized === "call_model") {
     return phase === "started" ? "Drafting response" : "Draft ready";
+  }
+
+  if (normalized === "compact_messages") {
+    return phase === "started"
+      ? "Summarizing earlier messages"
+      : "Summary complete";
   }
 
   return phase === "started"
@@ -1415,6 +1550,38 @@ function isEmbeddableArtifact(artifact: ChatArtifact): boolean {
   );
 }
 
+function CodeBlockWithCopy({ children, ...rest }: ComponentPropsWithoutRef<"pre">): ReactNode {
+  const [copied, setCopied] = useState(false);
+  const preRef = useRef<HTMLPreElement>(null);
+
+  function handleCopy() {
+    const text = preRef.current?.innerText ?? "";
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <div className="code-block-wrapper">
+      <button
+        type="button"
+        className={`code-copy-btn${copied ? " copied" : ""}`}
+        onClick={handleCopy}
+        aria-label="Copy code"
+        title="Copy code"
+      >
+        {copied ? (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+        )}
+      </button>
+      <pre ref={preRef} {...rest}>{children}</pre>
+    </div>
+  );
+}
+
 const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }): ReactNode {
   return (
     <ReactMarkdown
@@ -1422,7 +1589,10 @@ const MarkdownContent = memo(function MarkdownContent({ content }: { content: st
       components={{
         a: (props: ComponentPropsWithoutRef<"a">) => (
           <a {...props} target="_blank" rel="noreferrer" />
-        )
+        ),
+        pre: (props: ComponentPropsWithoutRef<"pre">) => (
+          <CodeBlockWithCopy {...props} />
+        ),
       }}
     >
       {content}
@@ -1466,10 +1636,37 @@ function ArtifactPreview({
   return (
     <div className="artifact-preview-empty">
       <span>Preview is not available for this file type.</span>
-      <a href={previewUrl} target="_blank" rel="noreferrer">
-        Open in new tab
+      <a href={previewUrl} target="_blank" rel="noreferrer" title="Open in new tab">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" /></svg>
       </a>
     </div>
+  );
+}
+
+function ArtifactCopyButton({ text }: { text: string }): ReactNode {
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <button
+      type="button"
+      className={`artifact-code-copy-btn${copied ? " copied" : ""}`}
+      onClick={handleCopy}
+      aria-label="Copy code"
+      title="Copy code"
+    >
+      {copied ? (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+      )}
+    </button>
   );
 }
 
@@ -1541,8 +1738,8 @@ function CodeArtifactPreview({
         </div>
         <div className="artifact-preview-empty">
           <span>Could not load code: {state.message}</span>
-          <a href={url} target="_blank" rel="noreferrer">
-            Open in new tab
+          <a href={url} target="_blank" rel="noreferrer" title="Open in new tab">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" /></svg>
           </a>
         </div>
       </div>
@@ -1555,6 +1752,7 @@ function CodeArtifactPreview({
       <div className="artifact-code-header">
         <span className="artifact-code-language">{language}</span>
         <span className="artifact-code-filename">{filename}</span>
+        <ArtifactCopyButton text={state.text} />
       </div>
       <pre className={`artifact-code-pre language-${language}`}>
         <code>
@@ -1640,14 +1838,20 @@ const MessageRow = memo(function MessageRow({
   isStreaming,
   streamingStatus,
   planItems,
+  hasLogs,
+  isLogPanelMessage,
   onOpenArtifactPanel,
+  onOpenLogPanel,
 }: {
   message: ChatMessage;
   isArtifactPanelMessage: boolean;
   isStreaming: boolean;
   streamingStatus: string;
   planItems: PlanItem[];
+  hasLogs: boolean;
+  isLogPanelMessage: boolean;
   onOpenArtifactPanel: (message: ChatMessage) => void;
+  onOpenLogPanel: (messageId: string) => void;
 }): ReactNode {
   const isAssistant = message.role === "assistant";
   const rowClassName = isAssistant
@@ -1702,8 +1906,20 @@ const MessageRow = memo(function MessageRow({
                   : "message-artifact-preview-button"
               }
               onClick={() => onOpenArtifactPanel(message)}
+              title="Preview"
             >
-              Preview
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="18" rx="2" /><line x1="10" y1="3" x2="10" y2="21" /></svg>
+            </button>
+          </div>
+        ) : null}
+        {isAssistant && hasLogs ? (
+          <div className="message-log-action">
+            <button
+              type="button"
+              className={isLogPanelMessage ? "message-log-button active" : "message-log-button"}
+              onClick={() => onOpenLogPanel(message.id)}
+            >
+              <LogIcon /> <span>Log</span>
             </button>
           </div>
         ) : null}
@@ -1715,19 +1931,25 @@ const MessageRow = memo(function MessageRow({
 const MessageList = memo(function MessageList({
   messages,
   activeArtifactPanelMessageId,
+  activeLogPanelMessageId,
   streamingMessageId,
   streamingStatus,
   streamingPlanItems,
   messagePlans,
+  messageLogs,
   onOpenArtifactPanel,
+  onOpenLogPanel,
 }: {
   messages: ChatMessage[];
   activeArtifactPanelMessageId: string | null;
+  activeLogPanelMessageId: string | null;
   streamingMessageId: string | null;
   streamingStatus: string;
   streamingPlanItems: PlanItem[];
   messagePlans: Record<string, PlanItem[]>;
+  messageLogs: Record<string, LogEntry[]>;
   onOpenArtifactPanel: (message: ChatMessage) => void;
+  onOpenLogPanel: (messageId: string) => void;
 }): ReactNode {
   return (
     <>
@@ -1736,6 +1958,7 @@ const MessageList = memo(function MessageList({
         const planItems = isStreaming
           ? streamingPlanItems
           : messagePlans[message.id] ?? EMPTY_PLAN_ITEMS;
+        const logEntries = messageLogs[message.id];
         return (
           <MessageRow
             key={message.id}
@@ -1744,13 +1967,579 @@ const MessageList = memo(function MessageList({
             isStreaming={isStreaming}
             streamingStatus={isStreaming ? streamingStatus : ""}
             planItems={planItems}
+            hasLogs={logEntries != null && logEntries.length > 0}
+            isLogPanelMessage={activeLogPanelMessageId === message.id}
             onOpenArtifactPanel={onOpenArtifactPanel}
+            onOpenLogPanel={onOpenLogPanel}
           />
         );
       })}
     </>
   );
 });
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" width="14" height="14">
+      <rect
+        x="6" y="6" width="12" height="12" rx="2"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+function LogIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" width="14" height="14">
+      <path
+        d="M4 6h16M4 12h16M4 18h10"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function formatLogTime(timestamp: number): string {
+  const d = new Date(timestamp);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+}
+
+function ToolResultDetails({ details }: { details: Record<string, unknown> }): ReactNode {
+  if (Object.keys(details).length === 0) {
+    return null;
+  }
+
+  const parts: ReactNode[] = [];
+
+  // SQL query results
+  if ("row_count" in details) {
+    const cols = Array.isArray(details.columns) ? (details.columns as string[]) : [];
+    parts.push(
+      <div key="sql" className="log-entry-detail-section">
+        <div className="log-entry-detail-row">
+          <span className="log-entry-detail-label">Database</span>
+          <span>{String(details.database ?? "")}</span>
+        </div>
+        <div className="log-entry-detail-row">
+          <span className="log-entry-detail-label">Rows</span>
+          <span>{String(details.row_count)}{details.truncated ? " (truncated)" : ""}</span>
+        </div>
+        {cols.length > 0 ? (
+          <div className="log-entry-detail-row">
+            <span className="log-entry-detail-label">Columns</span>
+            <span className="log-entry-detail-columns">{cols.join(", ")}</span>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  // Analysis summary
+  if ("summary" in details) {
+    parts.push(
+      <div key="summary" className="log-entry-detail-section">
+        <span className="log-entry-detail-label">Summary</span>
+        <CodeBlockWithCopy className="log-entry-code">{String(details.summary)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  // Analysis metrics
+  if ("metrics" in details && typeof details.metrics === "object" && details.metrics !== null) {
+    const metrics = details.metrics as Record<string, unknown>;
+    const metricEntries = Object.entries(metrics);
+    if (metricEntries.length > 0) {
+      parts.push(
+        <div key="metrics" className="log-entry-detail-section">
+          <span className="log-entry-detail-label">Metrics</span>
+          <div className="log-entry-metrics-grid">
+            {metricEntries.map(([key, value]) => (
+              <div key={key} className="log-entry-detail-row">
+                <span className="log-entry-detail-metric-key">{key}</span>
+                <span>{String(value)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+  }
+
+  // Table info
+  if ("table_rows" in details) {
+    parts.push(
+      <div key="table" className="log-entry-detail-row">
+        <span className="log-entry-detail-label">Table output</span>
+        <span>{String(details.table_rows)} rows</span>
+      </div>
+    );
+  }
+
+  // Findings count
+  if ("findings_count" in details) {
+    parts.push(
+      <div key="findings" className="log-entry-detail-row">
+        <span className="log-entry-detail-label">Findings</span>
+        <span>{String(details.findings_count)}</span>
+      </div>
+    );
+  }
+
+  // Stdout / stderr (shell, python)
+  if ("stdout" in details && String(details.stdout).trim()) {
+    parts.push(
+      <div key="stdout" className="log-entry-detail-section">
+        <span className="log-entry-detail-label">stdout</span>
+        <CodeBlockWithCopy className="log-entry-code">{String(details.stdout)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+  if ("stderr" in details && String(details.stderr).trim()) {
+    parts.push(
+      <div key="stderr" className="log-entry-detail-section">
+        <span className="log-entry-detail-label">stderr</span>
+        <CodeBlockWithCopy className="log-entry-code log-entry-stderr">{String(details.stderr)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  // Artifacts produced
+  if ("artifacts_count" in details && Number(details.artifacts_count) > 0) {
+    parts.push(
+      <div key="artifacts" className="log-entry-detail-row">
+        <span className="log-entry-detail-label">Artifacts produced</span>
+        <span>{String(details.artifacts_count)}</span>
+      </div>
+    );
+  }
+
+  // Error message (fallback for errors)
+  if ("message" in details && String(details.message).trim()) {
+    parts.push(
+      <div key="message" className="log-entry-detail-section">
+        <span className="log-entry-detail-label">Message</span>
+        <CodeBlockWithCopy className="log-entry-code">{String(details.message)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  // Raw fallback
+  if ("raw" in details) {
+    parts.push(
+      <div key="raw" className="log-entry-detail-section">
+        <CodeBlockWithCopy className="log-entry-code">{String(details.raw)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  if (parts.length === 0) {
+    return null;
+  }
+
+  return <div className="log-entry-details">{parts}</div>;
+}
+
+function LogEntryCard({ entry }: { entry: LogEntry }): ReactNode {
+  const time = formatLogTime(entry.timestamp);
+
+  if (entry.kind === "reasoning") {
+    return (
+      <div className="log-entry log-entry-reasoning">
+        <div className="log-entry-header">
+          <span className="log-entry-kind">reasoning</span>
+          <span className="log-entry-time">{time}</span>
+        </div>
+        <CodeBlockWithCopy className="log-entry-code">{entry.content}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  if (entry.kind === "node_lifecycle") {
+    // Error entries
+    if (entry.error) {
+      return (
+        <div className="log-entry log-entry-node log-entry-error">
+          <div className="log-entry-header">
+            <span className="log-entry-kind">{entry.nodeName} failed</span>
+            <span className="log-entry-time">{time}</span>
+          </div>
+          <CodeBlockWithCopy className="log-entry-code">{entry.error}</CodeBlockWithCopy>
+        </div>
+      );
+    }
+
+    // "finished" entries — render as full cards with details
+    const d = entry.details;
+    const hasDetails = Object.keys(d).length > 0;
+
+    // select_skills finished
+    if (entry.nodeName === "select_skills") {
+      const skills = Array.isArray(d.skills) ? (d.skills as { name: string; path?: string; description?: string; scope?: string }[]) : [];
+      const skillNames = Array.isArray(d.skill_names) ? (d.skill_names as string[]) : [];
+      if (skills.length > 0) {
+        return (
+          <div className="log-entry log-entry-skills">
+            <div className="log-entry-header">
+              <span className="log-entry-kind">select_skills {"\u2714"}</span>
+              <span className="log-entry-time">{time}</span>
+            </div>
+            <div className="log-entry-skill-list">
+              {skills.map((skill) => (
+                <div key={skill.name} className="log-entry-skill-item">
+                  <div className="log-entry-skill-name-row">
+                    <span className="log-entry-chip">{skill.name}</span>
+                    {skill.scope ? <span className="log-entry-skill-scope">{skill.scope}</span> : null}
+                  </div>
+                  {skill.description ? (
+                    <span className="log-entry-skill-desc">{skill.description}</span>
+                  ) : null}
+                  {skill.path ? (
+                    <span className="log-entry-skill-path">{skill.path}</span>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+      if (skillNames.length > 0) {
+        return (
+          <div className="log-entry log-entry-skills">
+            <div className="log-entry-header">
+              <span className="log-entry-kind">select_skills {"\u2714"}</span>
+              <span className="log-entry-time">{time}</span>
+            </div>
+            <div className="log-entry-chip-list">
+              {skillNames.map((name) => (
+                <span key={name} className="log-entry-chip">{name}</span>
+              ))}
+            </div>
+          </div>
+        );
+      }
+      // No skills activated
+      return (
+        <div className="log-entry log-entry-node">
+          <div className="log-entry-header">
+            <span className="log-entry-kind">select_skills {"\u2714"}</span>
+            <span className="log-entry-time">{time}</span>
+          </div>
+          <span className="log-entry-detail-muted">No skills activated</span>
+        </div>
+      );
+    }
+
+    // call_model finished
+    if (entry.nodeName === "call_model") {
+      const toolCalls = Array.isArray(d.tool_calls) ? (d.tool_calls as { tool_name: string; tool_args: Record<string, unknown> }[]) : [];
+      if (toolCalls.length > 0) {
+        return (
+          <div className="log-entry log-entry-tool-call">
+            <div className="log-entry-header">
+              <span className="log-entry-kind">call_model {"\u2714"}</span>
+              <span className="log-entry-time">{time}</span>
+            </div>
+            <span className="log-entry-detail-muted">Tool calls: {toolCalls.length}</span>
+            {toolCalls.map((tc, i) => {
+              const specialKeys = ["query", "script", "command", "sql_query"];
+              const specialKey = specialKeys.find((k) => k in tc.tool_args);
+              return (
+                <div key={i} className="log-entry-detail-section">
+                  <strong className="log-entry-tool-name">{tc.tool_name}</strong>
+                  {specialKey ? (
+                    <CodeBlockWithCopy className="log-entry-code">{String(tc.tool_args[specialKey])}</CodeBlockWithCopy>
+                  ) : (
+                    <CodeBlockWithCopy className="log-entry-code">{JSON.stringify(tc.tool_args, null, 2)}</CodeBlockWithCopy>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      }
+      return (
+        <div className="log-entry log-entry-node">
+          <div className="log-entry-header">
+            <span className="log-entry-kind">call_model {"\u2714"}</span>
+            <span className="log-entry-time">{time}</span>
+          </div>
+          <span className="log-entry-detail-muted">Generated response (no tool calls)</span>
+        </div>
+      );
+    }
+
+    // tools finished
+    if (entry.nodeName === "tools") {
+      const toolResults = Array.isArray(d.tool_results) ? (d.tool_results as { tool_name: string; ok: boolean | null; details: Record<string, unknown> }[]) : [];
+      if (toolResults.length > 0) {
+        return (
+          <div className="log-entry log-entry-tool-result">
+            <div className="log-entry-header">
+              <span className="log-entry-kind">tools {"\u2714"}</span>
+              <span className="log-entry-time">{time}</span>
+            </div>
+            {toolResults.map((tr, i) => {
+              const isError = tr.ok === false;
+              return (
+                <div key={i} className="log-entry-detail-section">
+                  <div className="log-entry-status-row">
+                    <strong className="log-entry-tool-name">{tr.tool_name}</strong>
+                    <span className={isError ? "log-entry-status-badge error" : "log-entry-status-badge ok"}>
+                      {isError ? "FAILED" : "OK"}
+                    </span>
+                  </div>
+                  <ToolResultDetails details={tr.details} />
+                </div>
+              );
+            })}
+          </div>
+        );
+      }
+    }
+
+    // Default finished: compact with no details
+    if (!hasDetails) {
+      return null;
+    }
+
+    // Generic finished with unknown details
+    return (
+      <div className="log-entry log-entry-node">
+        <div className="log-entry-header">
+          <span className="log-entry-kind">{entry.nodeName} {"\u2714"}</span>
+          <span className="log-entry-time">{time}</span>
+        </div>
+        <CodeBlockWithCopy className="log-entry-code">{JSON.stringify(d, null, 2)}</CodeBlockWithCopy>
+      </div>
+    );
+  }
+
+  if (entry.kind === "mcp_tool_call") {
+    return (
+      <div className="log-entry log-entry-mcp">
+        <div className="log-entry-header">
+          <span className="log-entry-kind">mcp</span>
+          <span className="log-entry-time">{time}</span>
+        </div>
+        <span>{entry.serverName} &rarr; {entry.toolName}</span>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+type LogStep =
+  | { type: "skills"; finishedEntry: LogEntry }
+  | { type: "iteration"; index: number; callModelFinished: LogEntry | null; toolsFinished: LogEntry | null; reasoningEntries: LogEntry[]; mcpEntries: LogEntry[] }
+  | { type: "orphan"; entry: LogEntry };
+
+const NOISE_NODES = new Set(["compact_messages", "enforce_analysis"]);
+
+function groupLogEntries(entries: LogEntry[]): LogStep[] {
+  const steps: LogStep[] = [];
+  let iterationIndex = 0;
+  let currentIteration: { type: "iteration"; index: number; callModelFinished: LogEntry | null; toolsFinished: LogEntry | null; reasoningEntries: LogEntry[]; mcpEntries: LogEntry[] } | null = null;
+
+  function flushIteration(): void {
+    if (currentIteration) {
+      steps.push(currentIteration);
+      currentIteration = null;
+    }
+  }
+
+  for (const entry of entries) {
+    if (entry.kind === "node_lifecycle") {
+      // Skip started phases entirely
+      if (entry.phase === "started") continue;
+      // Skip noise nodes
+      if (NOISE_NODES.has(entry.nodeName)) continue;
+
+      if (entry.nodeName === "select_skills") {
+        flushIteration();
+        steps.push({ type: "skills", finishedEntry: entry });
+        continue;
+      }
+
+      if (entry.nodeName === "call_model") {
+        flushIteration();
+        iterationIndex += 1;
+        currentIteration = { type: "iteration", index: iterationIndex, callModelFinished: entry, toolsFinished: null, reasoningEntries: [], mcpEntries: [] };
+        continue;
+      }
+
+      if (entry.nodeName === "tools") {
+        if (currentIteration) {
+          currentIteration.toolsFinished = entry;
+        } else {
+          // tools without a preceding call_model — wrap in its own iteration
+          iterationIndex += 1;
+          steps.push({ type: "iteration", index: iterationIndex, callModelFinished: null, toolsFinished: entry, reasoningEntries: [], mcpEntries: [] });
+        }
+        continue;
+      }
+
+      // Other node_lifecycle finished entries (not noise)
+      flushIteration();
+      steps.push({ type: "orphan", entry });
+      continue;
+    }
+
+    if (entry.kind === "reasoning") {
+      if (currentIteration) {
+        currentIteration.reasoningEntries.push(entry);
+      } else {
+        // Reasoning before any iteration — start a new one
+        iterationIndex += 1;
+        currentIteration = { type: "iteration", index: iterationIndex, callModelFinished: null, toolsFinished: null, reasoningEntries: [entry], mcpEntries: [] };
+      }
+      continue;
+    }
+
+    if (entry.kind === "mcp_tool_call") {
+      if (currentIteration) {
+        currentIteration.mcpEntries.push(entry);
+      } else {
+        iterationIndex += 1;
+        currentIteration = { type: "iteration", index: iterationIndex, callModelFinished: null, toolsFinished: null, reasoningEntries: [], mcpEntries: [entry] };
+      }
+      continue;
+    }
+
+    // Fallback
+    flushIteration();
+    steps.push({ type: "orphan", entry });
+  }
+
+  flushIteration();
+  return steps;
+}
+
+function iterationToolNames(step: LogStep & { type: "iteration" }): string[] {
+  if (!step.callModelFinished || step.callModelFinished.kind !== "node_lifecycle") return [];
+  const d = step.callModelFinished.details;
+  const toolCalls = Array.isArray(d.tool_calls) ? (d.tool_calls as { tool_name: string }[]) : [];
+  return toolCalls.map((tc) => tc.tool_name);
+}
+
+function iterationHasError(step: LogStep & { type: "iteration" }): boolean {
+  if (step.callModelFinished?.kind === "node_lifecycle" && step.callModelFinished.error) return true;
+  if (step.toolsFinished?.kind === "node_lifecycle" && step.toolsFinished.error) return true;
+  if (step.toolsFinished?.kind === "node_lifecycle") {
+    const d = step.toolsFinished.details;
+    const toolResults = Array.isArray(d.tool_results) ? (d.tool_results as { ok: boolean | null }[]) : [];
+    if (toolResults.some((tr) => tr.ok === false)) return true;
+  }
+  return false;
+}
+
+function skillStepLabel(step: LogStep & { type: "skills" }): string {
+  const entry = step.finishedEntry;
+  if (entry.kind !== "node_lifecycle") return "Skills";
+  const d = entry.details;
+  const skills = Array.isArray(d.skills) ? (d.skills as { name: string }[]) : [];
+  if (skills.length > 0) return `Skills: ${skills.map((s) => s.name).join(", ")}`;
+  const skillNames = Array.isArray(d.skill_names) ? (d.skill_names as string[]) : [];
+  if (skillNames.length > 0) return `Skills: ${skillNames.join(", ")}`;
+  return "Skills: none";
+}
+
+function LogStepSection({ step, defaultOpen }: { step: LogStep; defaultOpen: boolean }): ReactNode {
+  if (step.type === "orphan") {
+    return <LogEntryCard entry={step.entry} />;
+  }
+
+  if (step.type === "skills") {
+    const label = skillStepLabel(step);
+    const hasError = step.finishedEntry.kind === "node_lifecycle" && !!step.finishedEntry.error;
+    return (
+      <details
+        className={`log-step log-step-skills${hasError ? " log-step-error" : ""}`}
+        open={defaultOpen || hasError || undefined}
+      >
+        <summary className="log-step-summary">
+          <span className="log-step-icon">{"\u2728"}</span>
+          <span className="log-step-label">{label}</span>
+        </summary>
+        <div className="log-step-content">
+          <LogEntryCard entry={step.finishedEntry} />
+        </div>
+      </details>
+    );
+  }
+
+  // iteration
+  const toolNames = iterationToolNames(step);
+  const hasError = iterationHasError(step);
+  const toolSummary = toolNames.length > 0 ? toolNames.join(", ") : "response";
+  const statusBadge = hasError ? "ERR" : "OK";
+  const label = `Iteration ${step.index} \u2014 ${toolSummary}`;
+
+  return (
+    <details
+      className={`log-step log-step-iteration${hasError ? " log-step-error" : ""}`}
+      open={defaultOpen || hasError || undefined}
+    >
+      <summary className="log-step-summary">
+        <span className="log-step-icon">{hasError ? "\u2717" : "\u2714"}</span>
+        <span className="log-step-label">{label}</span>
+        <span className={hasError ? "log-entry-status-badge error" : "log-entry-status-badge ok"}>{statusBadge}</span>
+      </summary>
+      <div className="log-step-content">
+        {step.reasoningEntries.map((e) => (
+          <LogEntryCard key={e.id} entry={e} />
+        ))}
+        {step.mcpEntries.map((e) => (
+          <LogEntryCard key={e.id} entry={e} />
+        ))}
+        {step.callModelFinished ? <LogEntryCard entry={step.callModelFinished} /> : null}
+        {step.toolsFinished ? <LogEntryCard entry={step.toolsFinished} /> : null}
+      </div>
+    </details>
+  );
+}
+
+function LogPanel({
+  messageId,
+  entries,
+  onClose,
+}: {
+  messageId: string;
+  entries: LogEntry[];
+  onClose: () => void;
+}): ReactNode {
+  const steps = groupLogEntries(entries);
+  const stepCount = steps.length;
+
+  return (
+    <>
+      <div className="artifact-panel-header">
+        <div>
+          <p className="artifact-panel-kicker">Agent Log</p>
+          <h3>{stepCount === 1 ? "1 step" : `${stepCount} steps`}</h3>
+        </div>
+        <button type="button" className="artifact-panel-close" onClick={onClose}>
+          Close
+        </button>
+      </div>
+      <div className="log-panel-scroll">
+        <div className="log-entry-stack">
+          {steps.map((step, i) => {
+            const key = step.type === "orphan" ? step.entry.id : `step-${i}`;
+            const isLast = i === steps.length - 1;
+            return <LogStepSection key={key} step={step} defaultOpen={isLast} />;
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
 
 function PencilIcon() {
   return (

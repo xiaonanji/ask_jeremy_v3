@@ -37,6 +37,7 @@ Detailed guidance for using `prod_analytics.prod_source.stg_batchoperations_acco
 2. Otherwise we should use this condition to tell whether an account is in arrears or not: account_status = 7 AND arrears_days > 0 AND arrears_balance > 0 AND arrears_balance <= net_balance. If account is in arrears, take the arrears_days value as the Days Past Due (DPD) value.
 
 ### How to create DPD buckets
+When user asks distribution over arrears days or days past due (DPD), always prefer to return the binned DPD buckets instead of the raw values. Refer to the following for the binning logic.
 
 #### For product_id 1 (Zip Pay) and 7 (Zip Plus)
 
@@ -98,3 +99,28 @@ FROM PROD_ANALYTICS.prod_SOURCE.stg_batchoperations_account_daily_summary
 WHERE arrears_date >= CURRENT_DATE - 30 AND arrears_days > 0 AND arrears_balance > 0 AND arrears_balance >= net_balance
 ORDER BY arrears_date DESC, arrears_days DESC;
 ```
+
+---
+
+## Table Schema
+
+| # | Column Name | Data Type | Description |
+| --- | --- | --- | --- |
+| 1 | REPAYMENT_TYPE | NUMBER | Type of repayment associated with the account |
+| 2 | HOLD_PROCESSING | NUMBER | Indicator for processing holds on the account |
+| 3 | ARREARS_BALANCE | FLOAT | Outstanding balance in arrears |
+| 4 | ACCOUNT_STATUS | NUMBER | Current status code of the account |
+| 5 | ARREARS_DAYS | NUMBER | Number of days the account has been in arrears |
+| 6 | LOAN_ACCOUNT_NUMBER | NUMBER | Unique loan account number identifier |
+| 7 | LOAN_LIMIT | FLOAT | Maximum credit/loan limit for the account |
+| 8 | ARREARS_DATE | DATE | Date snapshot. Note this is not a date related to arrears. This is simply the snapshot date for all accounts |
+| 9 | LOAN_STATUS | TEXT | Current status of the loan (string representation) |
+| 10 | GENERAL_PURPOSE_1 | TEXT | General purpose field for additional data |
+| 11 | PRODUCT_ID | NUMBER | Product identifier associated with the account, 1 = 'Zip Pay', 2 = 'Zip Money', 7 = 'Zip Plus', 8 = 'Zip Personal Loan' |
+| 12 | NET_BALANCE | FLOAT | Net balance of the account |
+| 13 | CONTRACTUAL_AMOUNT | FLOAT | Contractual payment amount due |
+| 14 | ACCOUNT_ID | NUMBER | Unique account identifier |
+| 15 | SURROGATE_KEY | TEXT | Generated surrogate key (MD5 hash of account_id + arrears_date) |
+| 16 | DATA_LOADED_TIMESTAMP | TIMESTAMP_TZ | Timestamp when data was extracted/loaded from Airbyte |
+| 17 | CONTRACTUAL_DATE | DATE | Date of contractual payment |
+| 18 | CONTRACTUAL_AMOUNT_REMAINING | FLOAT | Remaining contractual amount to be paid |

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from mimetypes import guess_type
@@ -232,17 +233,18 @@ async def stream_message(session_id: str, payload: SendMessageRequest) -> Stream
     )
 
     async def event_generator():
+        stream = chat_client.stream_reply(
+            SessionContext(
+                session_id=session_detail.session.id,
+                workspace_path=session_detail.session.workspace_path,
+                artifacts_path=session_detail.session.workspace_path.parent / "artifacts",
+                database_backend=session_detail.session.database_backend,
+                model=model_config,
+            ),
+            session_detail.messages,
+        )
         try:
-            async for event in chat_client.stream_reply(
-                SessionContext(
-                    session_id=session_detail.session.id,
-                    workspace_path=session_detail.session.workspace_path,
-                    artifacts_path=session_detail.session.workspace_path.parent / "artifacts",
-                    database_backend=session_detail.session.database_backend,
-                    model=model_config,
-                ),
-                session_detail.messages,
-            ):
+            async for event in stream:
                 event_type = str(event.get("type"))
                 if event_type != "final_response":
                     yield _sse_event(event_type, event)
@@ -270,6 +272,10 @@ async def stream_message(session_id: str, payload: SendMessageRequest) -> Stream
                         "assistant_message": assistant_message.model_dump(mode="json"),
                     },
                 )
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected — close the stream to trigger worker cancellation.
+            await stream.aclose()
+            return
         except Exception as exc:
             yield _sse_event(
                 "error",

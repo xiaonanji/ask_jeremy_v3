@@ -99,14 +99,16 @@ export function sendMessage(
 export async function streamMessage(
   sessionId: string,
   content: string,
-  onEvent: (eventName: string, payload: unknown) => void
+  onEvent: (eventName: string, payload: unknown) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ content })
+    body: JSON.stringify({ content }),
+    signal,
   });
 
   if (!response.ok) {
@@ -123,31 +125,39 @@ export async function streamMessage(
   let buffer = "";
   let streamedDeltaEventsSinceYield = 0;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
 
-    let separatorIndex = buffer.indexOf("\n\n");
-    while (separatorIndex !== -1) {
-      const rawEvent = buffer.slice(0, separatorIndex);
-      buffer = buffer.slice(separatorIndex + 2);
-      const eventName = _dispatchSseEvent(rawEvent, onEvent);
-      if (eventName === "assistant_delta") {
-        streamedDeltaEventsSinceYield += 1;
-        if (streamedDeltaEventsSinceYield >= 4) {
-          streamedDeltaEventsSinceYield = 0;
-          await _nextAnimationFrame();
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex !== -1) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const eventName = _dispatchSseEvent(rawEvent, onEvent);
+        if (eventName === "assistant_delta") {
+          streamedDeltaEventsSinceYield += 1;
+          if (streamedDeltaEventsSinceYield >= 4) {
+            streamedDeltaEventsSinceYield = 0;
+            await _nextAnimationFrame();
+          }
         }
+        separatorIndex = buffer.indexOf("\n\n");
       }
-      separatorIndex = buffer.indexOf("\n\n");
-    }
 
-    if (done) {
-      if (buffer.trim()) {
-        _dispatchSseEvent(buffer, onEvent);
+      if (done) {
+        if (buffer.trim()) {
+          _dispatchSseEvent(buffer, onEvent);
+        }
+        return;
       }
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      await reader.cancel();
       return;
     }
+    throw err;
   }
 }
 

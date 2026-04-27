@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import json
+import logging
 import os
 import sqlite3
+import threading
 from typing import Annotated, TypedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ from uuid import uuid4
 
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.messages import AIMessageChunk, AnyMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessageChunk, AnyMessage, BaseMessage, RemoveMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -27,7 +29,7 @@ from .skills.catalog import SkillCatalog
 from .skills.discovery import SkillDiscoveryService
 from .skills.parser import SkillParser
 from .skills.prompting import SkillPromptRenderer
-from .mcp_tools import set_mcp_event_emitter
+from .mcp_tools import emit_custom_event, set_mcp_event_emitter
 from .tools import LocalToolRegistry
 
 
@@ -71,6 +73,7 @@ class SkillAwareState(TypedDict, total=False):
     active_skill_ids: list[str]
     active_skill_names: list[str]
     active_skill_instructions: list[str]
+    conversation_summary: str
 
 
 class LangGraphChatClient:
@@ -131,14 +134,28 @@ class LangGraphChatClient:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict[str, object] | BaseException | object] = asyncio.Queue()
         sentinel = object()
+        cancelled = threading.Event()
         config = {"configurable": {"thread_id": session.session_id}}
         history_messages = self._to_langchain_messages(history)
         graph_context = self._graph_context(session)
 
         def worker() -> None:
-            set_mcp_event_emitter(
-                lambda event: loop.call_soon_threadsafe(queue.put_nowait, event)
-            )
+            # Track details emitted during each node's execution so they
+            # can be bundled into the task_finished event.
+            node_details: list[dict] = []
+
+            def _emit_to_queue(event: dict) -> None:
+                """Put an event into node_details and the SSE queue."""
+                node_details.append(event)
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            # Store on instance so graph nodes can emit directly
+            self._stream_emit = _emit_to_queue
+
+            def _capturing_emitter(event: dict) -> None:
+                _emit_to_queue(event)
+
+            set_mcp_event_emitter(_capturing_emitter)
             connection = sqlite3.connect(
                 self.settings.langgraph_checkpoint_path,
                 check_same_thread=False,
@@ -153,9 +170,37 @@ class LangGraphChatClient:
                     context=graph_context,
                     stream_mode=["messages", "tasks"],
                 ):
+                    if cancelled.is_set():
+                        break
                     if mode == "messages":
                         message, metadata = data
-                        if metadata.get("langgraph_node") != "call_model":
+                        node_name = metadata.get("langgraph_node", "")
+
+                        # Capture tool results from the "tools" node
+                        if node_name == "tools" and isinstance(message, ToolMessage):
+                            content_str = str(message.content) if message.content else ""
+                            try:
+                                parsed = json.loads(content_str)
+                            except (json.JSONDecodeError, TypeError):
+                                parsed = None
+                            tool_result_event = {
+                                "type": "tool_result",
+                                "tool_call_id": getattr(message, "tool_call_id", ""),
+                                "tool_name": getattr(message, "name", ""),
+                                "ok": parsed.get("ok") if isinstance(parsed, dict) else None,
+                                "exit_code": parsed.get("exit_code") if isinstance(parsed, dict) else None,
+                                "error_type": parsed.get("error_type") if isinstance(parsed, dict) else None,
+                                "message": parsed.get("message", "") if isinstance(parsed, dict) else content_str[:500],
+                                "details": _summarize_tool_result(parsed, content_str),
+                            }
+                            node_details.append(tool_result_event)
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                tool_result_event,
+                            )
+                            continue
+
+                        if node_name != "call_model":
                             continue
                         if isinstance(message, AIMessageChunk):
                             delta = str(message.text)
@@ -167,10 +212,59 @@ class LangGraphChatClient:
                                         "delta": delta,
                                     },
                                 )
+
+                        # Capture tool calls from ANY message type
+                        # (AIMessage from .invoke(), or AIMessageChunk
+                        # with accumulated tool_calls from streaming).
+                        # Chunks arrive incrementally: ID/name first, args
+                        # filled in by later chunks.  We update existing
+                        # entries in-place so node_details always holds the
+                        # most complete version for _build_task_finished_details.
+                        seen_tc_map: dict[str, dict] = {
+                            d["tool_call_id"]: d
+                            for d in node_details
+                            if d.get("type") == "tool_call"
+                        }
+                        for tc in getattr(message, "tool_calls", None) or []:
+                            tc_id = (
+                                tc.get("id", "")
+                                if isinstance(tc, dict)
+                                else getattr(tc, "id", "")
+                            )
+                            tc_name = (
+                                tc.get("name", "")
+                                if isinstance(tc, dict)
+                                else getattr(tc, "name", "")
+                            )
+                            tc_args = (
+                                tc.get("args", {})
+                                if isinstance(tc, dict)
+                                else getattr(tc, "args", {})
+                            )
+                            existing = seen_tc_map.get(tc_id)
+                            if existing is not None:
+                                # Update with latest (more complete) values
+                                if tc_name:
+                                    existing["tool_name"] = tc_name
+                                if tc_args:
+                                    existing["tool_args"] = tc_args
+                                continue
+                            tc_event = {
+                                "type": "tool_call",
+                                "tool_call_id": tc_id,
+                                "tool_name": tc_name,
+                                "tool_args": tc_args,
+                            }
+                            seen_tc_map[tc_id] = tc_event
+                            node_details.append(tc_event)
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait, tc_event
+                            )
                         continue
 
                     if mode == "tasks":
                         if "triggers" in data:
+                            node_details.clear()
                             loop.call_soon_threadsafe(
                                 queue.put_nowait,
                                 {
@@ -181,6 +275,11 @@ class LangGraphChatClient:
                             )
                             continue
 
+                        # Bundle details captured during this node's execution
+                        details = _build_task_finished_details(
+                            data["name"], node_details
+                        )
+                        node_details.clear()
                         loop.call_soon_threadsafe(
                             queue.put_nowait,
                             {
@@ -188,6 +287,7 @@ class LangGraphChatClient:
                                 "task_id": data["id"],
                                 "name": data["name"],
                                 "error": data.get("error"),
+                                "details": details,
                             },
                         )
 
@@ -206,6 +306,7 @@ class LangGraphChatClient:
             except BaseException as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
             finally:
+                self._stream_emit = None
                 connection.close()
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
@@ -218,17 +319,24 @@ class LangGraphChatClient:
                 if isinstance(item, BaseException):
                     raise item
                 yield item
+        except GeneratorExit:
+            # Client disconnected — signal the worker to stop.
+            cancelled.set()
+            raise
         finally:
+            cancelled.set()
             await worker_task
 
     def _build_graph(self, *, streaming: bool, checkpointer=None):
         builder = StateGraph(SkillAwareState, context_schema=GraphContext)
         builder.add_node("select_skills", self._select_skills)
+        builder.add_node("compact_messages", self._compact_messages)
         builder.add_node("call_model", self._call_model)
         builder.add_node("tools", ToolNode(self._tools))
         builder.add_node("enforce_analysis", self._enforce_data_pipeline)
         builder.add_edge(START, "select_skills")
-        builder.add_edge("select_skills", "call_model")
+        builder.add_edge("select_skills", "compact_messages")
+        builder.add_edge("compact_messages", "call_model")
         builder.add_conditional_edges(
             "call_model",
             self._route_after_model,
@@ -238,8 +346,8 @@ class LangGraphChatClient:
                 "end": END,
             },
         )
-        builder.add_edge("tools", "call_model")
-        builder.add_edge("enforce_analysis", "call_model")
+        builder.add_edge("tools", "compact_messages")
+        builder.add_edge("enforce_analysis", "compact_messages")
         return builder.compile(checkpointer=checkpointer or self._checkpointer)
 
     def set_mcp_tools(self, tools: list) -> None:
@@ -315,9 +423,33 @@ class LangGraphChatClient:
 
         merged_ids = [*current_ids, *[skill.id for skill in newly_selected]]
         hydrated = self.skill_activation.hydrate(merged_ids)
+
+        skill_names = [skill.name for skill in hydrated]
+        if skill_names:
+            skill_details = []
+            for skill in hydrated:
+                definition = self.skill_catalog.get(skill.id)
+                detail: dict[str, str] = {"name": skill.name}
+                if definition is not None:
+                    detail["path"] = str(definition.skill_file)
+                    detail["description"] = definition.description
+                    detail["scope"] = definition.scope
+                skill_details.append(detail)
+            event = {
+                "type": "skills_activated",
+                "names": skill_names,
+                "skills": skill_details,
+            }
+            # Emit directly via the queue (bypasses thread-local emitter)
+            emitter = getattr(self, "_stream_emit", None)
+            if emitter is not None:
+                emitter(event)
+            else:
+                emit_custom_event(event)
+
         return {
             "active_skill_ids": [skill.id for skill in hydrated],
-            "active_skill_names": [skill.name for skill in hydrated],
+            "active_skill_names": skill_names,
             "active_skill_instructions": [
                 self.skill_prompt_renderer.render_active_instructions(hydrated)
             ]
@@ -362,12 +494,19 @@ class LangGraphChatClient:
                 ]
             }
 
-        messages = _trim_message_history(
-            list(state["messages"]),
-            context.max_history_messages,
-        )
+        messages = list(state["messages"])
 
         database_display = _database_display_name(context.database_backend)
+
+        summary = state.get("conversation_summary", "")
+        summary_messages: list[SystemMessage] = []
+        if summary:
+            summary_messages = [SystemMessage(content=(
+                "=== EARLIER CONVERSATION CONTEXT ===\n"
+                "The following summarizes earlier parts of this conversation:\n\n"
+                f"{summary}"
+            ))]
+
         prompt = [
             SystemMessage(
                 content=(
@@ -388,6 +527,7 @@ class LangGraphChatClient:
                     f"is supported there, or consult {database_display} documentation conventions."
                 )
             ),
+            *summary_messages,
             *self._skill_prompt_messages(state),
             *messages,
         ]
@@ -396,6 +536,19 @@ class LangGraphChatClient:
             response = AIMessage(content=str(response))
         if not response.id:
             response = response.model_copy(update={"id": str(uuid4())})
+        if getattr(response, "tool_calls", None):
+            emitter = getattr(self, "_stream_emit", None)
+            for tc in response.tool_calls:
+                event = {
+                    "type": "tool_call",
+                    "tool_call_id": tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", ""),
+                    "tool_name": tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", ""),
+                    "tool_args": tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {}),
+                }
+                if emitter is not None:
+                    emitter(event)
+                else:
+                    emit_custom_event(event)
         return {"messages": [response]}
 
     def _enforce_data_pipeline(
@@ -432,6 +585,9 @@ class LangGraphChatClient:
         messages = state.get("messages", [])
         assistant_message = self._latest_ai_message(messages)
         if assistant_message is None:
+            return "end"
+
+        if self._is_no_credentials_reply(assistant_message):
             return "end"
 
         if getattr(assistant_message, "tool_calls", None):
@@ -557,6 +713,9 @@ class LangGraphChatClient:
             f"Workspace: {context.workspace_path}\n"
             f"Last user message: {latest}"
         )
+
+    def _is_no_credentials_reply(self, message: AIMessage) -> bool:
+        return "no provider credentials are configured" in self._message_text(message)
 
     def _message_text(self, message: BaseMessage) -> str:
         content = message.content
@@ -730,6 +889,164 @@ class LangGraphChatClient:
             lines.append(f"{role}: {self._message_text(message)}")
         return "\n".join(lines)
 
+    def _compact_messages(
+        self,
+        state: SkillAwareState,
+        runtime: Runtime[GraphContext],
+    ) -> dict:
+        context = runtime.context
+        messages = list(state.get("messages", []))
+
+        if len(messages) < context.max_history_messages:
+            return {}
+
+        if not context.api_key:
+            return {}
+
+        # Find the latest HumanMessage index (pinned — always kept).
+        pinned_index: int | None = None
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                pinned_index = i
+                break
+
+        # Identify the last 5 message indices (kept untouched).
+        total = len(messages)
+        tail_start = max(0, total - 5)
+        tail_indices = set(range(tail_start, total))
+
+        # Build the set of indices to keep.
+        keep_indices = set(tail_indices)
+        if pinned_index is not None:
+            keep_indices.add(pinned_index)
+
+        # Expand keep_indices to preserve tool-call integrity: an
+        # AIMessage(tool_calls) and its ToolMessage responses must stay
+        # together, otherwise the model API rejects the prompt.
+
+        # Map tool_call_id → index of the parent AIMessage.
+        tool_call_parent: dict[str, int] = {}
+        # Map AIMessage index → set of its ToolMessage indices.
+        ai_tool_children: dict[int, set[int]] = {}
+
+        for i, msg in enumerate(messages):
+            if isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None)
+                if tool_calls:
+                    ai_tool_children[i] = set()
+                    for tc in tool_calls:
+                        if isinstance(tc, dict) and "id" in tc:
+                            tool_call_parent[tc["id"]] = i
+            elif isinstance(msg, ToolMessage):
+                tcid = getattr(msg, "tool_call_id", None)
+                if tcid and tcid in tool_call_parent:
+                    ai_tool_children.setdefault(tool_call_parent[tcid], set()).add(i)
+
+        changed = True
+        while changed:
+            changed = False
+            for idx in list(keep_indices):
+                msg = messages[idx]
+                # Keeping a ToolMessage → must also keep its parent AIMessage.
+                if isinstance(msg, ToolMessage):
+                    tcid = getattr(msg, "tool_call_id", None)
+                    if tcid and tcid in tool_call_parent:
+                        parent_idx = tool_call_parent[tcid]
+                        if parent_idx not in keep_indices:
+                            keep_indices.add(parent_idx)
+                            changed = True
+                # Keeping an AIMessage with tool_calls → must keep all its ToolMessages.
+                if isinstance(msg, AIMessage) and idx in ai_tool_children:
+                    for child_idx in ai_tool_children[idx]:
+                        if child_idx not in keep_indices:
+                            keep_indices.add(child_idx)
+                            changed = True
+
+        # Messages to summarize: everything NOT in keep_indices.
+        to_summarize = [
+            (i, messages[i])
+            for i in range(total)
+            if i not in keep_indices
+        ]
+
+        if not to_summarize:
+            return {}
+
+        old_summary = state.get("conversation_summary", "")
+
+        try:
+            new_summary = self._generate_compaction_summary(
+                context, [msg for _, msg in to_summarize], old_summary
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Message compaction summary failed; skipping compaction this cycle.",
+                exc_info=True,
+            )
+            return {}
+
+        # Build RemoveMessage entries for all summarized messages.
+        removals: list[RemoveMessage] = []
+        for _, msg in to_summarize:
+            if getattr(msg, "id", None):
+                removals.append(RemoveMessage(id=msg.id))
+
+        return {
+            "messages": removals,
+            "conversation_summary": new_summary,
+        }
+
+    def _generate_compaction_summary(
+        self,
+        context: GraphContext,
+        messages_to_summarize: list[BaseMessage],
+        previous_summary: str,
+    ) -> str:
+        lines: list[str] = []
+        for msg in messages_to_summarize:
+            if isinstance(msg, HumanMessage):
+                lines.append(f"User: {self._message_text(msg)}")
+            elif isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None)
+                text = self._message_text(msg)
+                if text:
+                    lines.append(f"Assistant: {text[:500]}")
+                elif tool_calls:
+                    names = ", ".join(
+                        tc.get("name", "unknown") for tc in tool_calls if isinstance(tc, dict)
+                    )
+                    lines.append(f"Assistant: [called tools: {names}]")
+            elif isinstance(msg, ToolMessage):
+                lines.append(f"Tool result: {self._message_text(msg)[:300]}")
+            elif isinstance(msg, SystemMessage):
+                lines.append(f"System: {self._message_text(msg)[:200]}")
+
+        conversation_block = "\n".join(lines)
+
+        user_content = ""
+        if previous_summary:
+            user_content += (
+                "Previous conversation summary:\n"
+                f"{previous_summary}\n\n"
+            )
+        user_content += (
+            "New messages to incorporate:\n"
+            f"{conversation_block}"
+        )
+
+        summary_prompt = [
+            SystemMessage(content=(
+                "Summarize the following conversation history into a concise context "
+                "paragraph (3-5 sentences). Capture: user questions asked, data queries "
+                "performed and their outcomes, key findings, and any user preferences. "
+                "Be factual. Output ONLY the summary."
+            )),
+            HumanMessage(content=user_content),
+        ]
+
+        response = self._get_model(context).invoke(summary_prompt)
+        return self._message_text(response)
+
     def _parse_selected_skill_ids(self, response_text: str) -> list[str]:
         payload = self._extract_json_object(response_text)
         if payload is None:
@@ -814,60 +1131,99 @@ def _database_display_name(backend: DatabaseBackend) -> str:
     return str(backend)
 
 
-def _trim_message_history(
-    messages: list[BaseMessage],
-    max_messages: int,
-) -> list[BaseMessage]:
-    """Trim message history to at most max_messages, keeping tool-call sequences intact.
+def _build_task_finished_details(
+    node_name: str, captured_events: list[dict]
+) -> dict[str, object]:
+    """Summarise what happened during a node's execution for the log panel."""
+    details: dict[str, object] = {}
 
-    Three problems are handled here:
-    1. A naive tail-slice can cut between AIMessage(tool_calls=[X]) and ToolMessage(X),
-       producing a 400 from the model API.
-    2. A mid-turn crash (or the previous missing-config bug) can leave a trailing
-       AIMessage(tool_calls=[X]) with no ToolMessage in the LangGraph checkpoint.
-       When the user sends a new message the HumanMessage lands *after* the orphan,
-       so we must drop only the orphaned AIMessage, not the messages that follow.
-    3. The trim boundary can produce leading orphan ToolMessages whose AIMessage
-       parent was sliced away.
+    if node_name == "select_skills":
+        # Look for skills_activated events emitted during this node
+        for event in captured_events:
+            if event.get("type") == "skills_activated":
+                details["skills"] = event.get("skills", [])
+                details["skill_names"] = event.get("names", [])
+                break
+        if "skill_names" not in details:
+            details["skill_names"] = []
 
-    Strategy: trim first, then do a single forward pass that rebuilds the list,
-    skipping any incomplete AIMessage(tool_calls) block and any leading orphan
-    ToolMessages.
-    """
-    if max_messages > 0 and len(messages) > max_messages:
-        messages = messages[-max_messages:]
+    elif node_name == "call_model":
+        tool_calls = []
+        for event in captured_events:
+            if event.get("type") == "tool_call":
+                tool_calls.append({
+                    "tool_name": event.get("tool_name", ""),
+                    "tool_args": event.get("tool_args", {}),
+                })
+        details["tool_calls"] = tool_calls
 
-    # Drop leading orphan ToolMessages (their AIMessage parent was cut by the trim).
-    start = 0
-    while start < len(messages) and isinstance(messages[start], ToolMessage):
-        start += 1
-    messages = messages[start:]
+    elif node_name == "tools":
+        tool_results = []
+        for event in captured_events:
+            if event.get("type") == "tool_result":
+                tool_results.append({
+                    "tool_name": event.get("tool_name", ""),
+                    "ok": event.get("ok"),
+                    "details": event.get("details", {}),
+                })
+        details["tool_results"] = tool_results
 
-    # Forward pass: keep every message except AIMessage(tool_calls) blocks where
-    # at least one tool_call_id has no matching ToolMessage immediately after.
-    result: list[BaseMessage] = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        tool_calls = getattr(msg, "tool_calls", None) if isinstance(msg, AIMessage) else None
+    return details
 
-        if not isinstance(msg, AIMessage) or not tool_calls:
-            result.append(msg)
-            i += 1
-            continue
 
-        # Collect the ToolMessages that immediately follow this AIMessage.
-        call_ids = {tc["id"] for tc in tool_calls if isinstance(tc, dict) and "id" in tc}
-        j = i + 1
-        while j < len(messages) and isinstance(messages[j], ToolMessage):
-            call_ids.discard(getattr(messages[j], "tool_call_id", None))
-            j += 1
+def _summarize_tool_result(parsed: dict | None, raw: str) -> dict[str, object]:
+    """Extract the most useful fields from a tool result for the log panel."""
+    if not isinstance(parsed, dict):
+        return {"raw": raw[:1000]} if raw else {}
 
-        if not call_ids:
-            # All tool_call_ids answered — include the whole block.
-            result.extend(messages[i:j])
-        # else: incomplete block — silently drop the AIMessage and its partial
-        # ToolMessages; everything after j is kept normally.
-        i = j
+    summary: dict[str, object] = {}
 
-    return result
+    # SQL query results (execute_sql_query)
+    if "row_count" in parsed:
+        summary["database"] = parsed.get("database", "")
+        summary["row_count"] = parsed.get("row_count")
+        summary["columns"] = parsed.get("columns", [])
+        summary["truncated"] = parsed.get("truncated", False)
+        if parsed.get("artifact_id"):
+            summary["artifact_id"] = parsed["artifact_id"]
+
+    # Analysis results (run_analysis_script, read_analysis_result)
+    if "result" in parsed and isinstance(parsed["result"], dict):
+        result = parsed["result"]
+        if result.get("summary"):
+            summary["summary"] = str(result["summary"])[:500]
+        if result.get("metrics"):
+            summary["metrics"] = result["metrics"]
+        if result.get("findings"):
+            summary["findings_count"] = len(result["findings"])
+        if result.get("table"):
+            table = result["table"]
+            if isinstance(table, list):
+                summary["table_rows"] = len(table)
+            elif isinstance(table, dict) and "rows" in table:
+                summary["table_rows"] = len(table["rows"])
+        if parsed.get("analysis_artifact_id"):
+            summary["analysis_artifact_id"] = parsed["analysis_artifact_id"]
+
+    # Python script results (run_python_script)
+    if "stdout" in parsed:
+        stdout = str(parsed.get("stdout", ""))
+        stderr = str(parsed.get("stderr", ""))
+        if stdout.strip():
+            summary["stdout"] = stdout[:1000]
+        if stderr.strip():
+            summary["stderr"] = stderr[:1000]
+        if parsed.get("artifacts"):
+            summary["artifacts_count"] = len(parsed["artifacts"])
+
+    # Error details
+    if parsed.get("message"):
+        summary["message"] = str(parsed["message"])[:500]
+    if parsed.get("error_type"):
+        summary["error_type"] = parsed["error_type"]
+    if parsed.get("recoverable") is not None:
+        summary["recoverable"] = parsed["recoverable"]
+
+    return summary
+
+

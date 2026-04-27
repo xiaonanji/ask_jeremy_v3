@@ -10,6 +10,7 @@ from .models import SkillDefinition, SkillMetadata, SkillScope
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTALL)
 _LOCAL_LINK_RE = re.compile(r"\[[^\]]+\]\((?!https?://|app://|plugin://|file://)([^)\s]+)\)")
+_BACKTICK_PATH_RE = re.compile(r"`((?:[\w.@-]+/)+[\w.@-]+\.\w+)`")
 
 
 class SkillParser:
@@ -22,7 +23,7 @@ class SkillParser:
         raw = skill_file.read_text(encoding="utf-8")
         metadata, instructions = self._parse_frontmatter(raw)
         skill_dir = skill_file.parent
-        references = tuple(self._extract_references(instructions, skill_dir))
+        references, path_map = self._extract_references_with_mapping(instructions, skill_dir)
         return SkillDefinition(
             id=self._build_id(scope, skill_dir),
             name=metadata.name,
@@ -32,7 +33,8 @@ class SkillParser:
             skill_dir=skill_dir,
             skill_file=skill_file,
             instructions=instructions.strip(),
-            references=references,
+            references=tuple(references),
+            reference_path_map=path_map,
         )
 
     def _parse_frontmatter(self, raw: str) -> tuple[SkillMetadata, str]:
@@ -86,10 +88,16 @@ class SkillParser:
             return normalized or None
         return None
 
-    def _extract_references(self, instructions: str, skill_dir: Path) -> list[Path]:
+    def _extract_references_with_mapping(
+        self, instructions: str, skill_dir: Path
+    ) -> tuple[list[Path], dict[str, str]]:
+        """Extract references and build a relative-to-absolute path mapping."""
         references: list[Path] = []
+        path_map: dict[str, str] = {}
         seen: set[Path] = set()
-        for relative_path in _LOCAL_LINK_RE.findall(instructions):
+        relative_paths = _LOCAL_LINK_RE.findall(instructions)
+        relative_paths.extend(_BACKTICK_PATH_RE.findall(instructions))
+        for relative_path in relative_paths:
             candidate = (skill_dir / relative_path).resolve()
             try:
                 candidate.relative_to(skill_dir.resolve())
@@ -98,7 +106,8 @@ class SkillParser:
             if candidate.exists() and candidate not in seen:
                 seen.add(candidate)
                 references.append(candidate)
-        return references
+                path_map[relative_path] = str(candidate)
+        return references, path_map
 
     def _build_id(self, scope: SkillScope, skill_dir: Path) -> str:
         digest = hashlib.sha1(str(skill_dir).encode("utf-8")).hexdigest()[:12]
