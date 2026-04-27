@@ -209,5 +209,8 @@ __marimo__/
 # Node
 node_modules/
 
+# Windows reserved device names
+nul
+
 # Project runtime state
 backend/data/
