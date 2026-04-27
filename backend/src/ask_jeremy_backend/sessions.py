@@ -166,6 +166,12 @@ class SessionStore:
     ) -> SessionMetadata:
         session_dir = self._session_dir(session_id)
         with self._lock_for(session_id):
+            messages = self._read_messages(session_dir)
+            if messages:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Cannot change database backend after messages have been sent.",
+                )
             metadata = self._read_metadata(session_dir).model_copy(
                 update={
                     "database_backend": database_backend,

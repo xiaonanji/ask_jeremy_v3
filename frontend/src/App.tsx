@@ -1032,7 +1032,7 @@ export default function App() {
                     onChange={(event) =>
                       void handleDatabaseChange(event.target.value as DatabaseBackend)
                     }
-                    disabled={isUpdatingDatabase || isUpdatingModel || isSending}
+                    disabled={isUpdatingDatabase || isUpdatingModel || isSending || activeSession.messages.length > 0}
                   >
                     <option value="sqlite">SQLite</option>
                     <option value="snowflake">Snowflake</option>
