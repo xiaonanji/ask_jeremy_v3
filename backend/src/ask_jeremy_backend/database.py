@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -15,6 +16,11 @@ from .config import Settings
 from .schemas import DatabaseBackend
 
 _QUERY_TAG = "ask_jeremy_sql_connector"
+
+_CREATE_TEMP_TABLE_RE = re.compile(
+    r"^create\s+(or\s+replace\s+)?(temp|temporary)\s+table\s",
+    re.IGNORECASE,
+)
 
 
 class DatabaseConnectorError(RuntimeError):
@@ -129,7 +135,8 @@ class SqlQueryExecutor:
         started_at = monotonic()
 
         try:
-            connection.execute("PRAGMA query_only = ON")
+            if not _CREATE_TEMP_TABLE_RE.match(query):
+                connection.execute("PRAGMA query_only = ON")
             connection.set_progress_handler(
                 lambda: int(
                     monotonic() - started_at > self.settings.sql_query_timeout_seconds
@@ -331,11 +338,19 @@ def _sanitize_query(query: str) -> str:
         "explain",
         "list",
     )
-    if not any(lowered.startswith(prefix) for prefix in _ALLOWED_PREFIXES):
+    if lowered.startswith("create"):
+        if not _CREATE_TEMP_TABLE_RE.match(statement_without_comments):
+            raise QueryValidationError(
+                "Only CREATE [OR REPLACE] TEMPORARY TABLE statements are allowed. "
+                "Creating non-temporary tables, views, or other objects is prohibited."
+            )
+    elif not any(lowered.startswith(prefix) for prefix in _ALLOWED_PREFIXES):
         raise QueryValidationError(
-            "Only read-only statements are allowed (SELECT, WITH, SHOW, "
-            "DESCRIBE, EXPLAIN, LIST). Data-modifying statements (INSERT, "
-            "UPDATE, DELETE, DROP, ALTER, etc.) are prohibited."
+            "Only read-only statements and CREATE TEMPORARY TABLE are allowed "
+            "(SELECT, WITH, SHOW, DESCRIBE, EXPLAIN, LIST, "
+            "CREATE [OR REPLACE] TEMPORARY TABLE). "
+            "Data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) "
+            "are prohibited."
         )
 
     return statement_without_comments

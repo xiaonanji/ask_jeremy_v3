@@ -56,6 +56,30 @@ Note that for each table below, there is a reference markdown file that provides
 - Best for: Get a CLV bscore for a particular customer (customer_id) at a particular date (obs_date). It can be used for customer behaviour analysis and CLV related analysis.
 - Reference: `references/stg_databricks_ds_clv_behsc_scoring.md`
 
+### common_account_application_details
+- Full name: `prod_analytics.prod_mart.common_account_application_details`
+- Description: The **central AU application-level mart table** — one row per consumer that has started an application. It combines application metadata, underwriting decisions, credit bureau data, banking statement features, account lifecycle metrics, and cross-product behavioural signals into a single wide table.
+- Best for: Get application-level information for a particular consumer.
+- Reference: `references/common_account_application_details.md`
+
+### dim_account
+- Full name: `prod_analytics.prod_prep.dim_account`
+- Description:  The **primary account dimension** in Zip's Snowflake analytics platform. It provides the **current state** of every account across all AU and NZ products (Zip Pay, Zip Money, Zip Plus, Zip Biz, Zip Personal Loan).
+- Best for: Get account-level information for a particular account.
+- Reference: `references/dim_account.md`
+
+### risk_credit_changes
+- Full name: `prod_analytics.prod_mart.risk_credit_changes`
+- Description: This is a daily-refreshed mart table that contains the **complete history of credit limit changes** across all Zip products (Zip Pay, Zip Money, Zip Plus). Each row represents a single credit limit change event — either a Credit Limit Decrease (CLD) or Credit Limit Increase (CLI) — for a customer account.
+- Best for: Analyzing credit changes and their impact on account behavior and risk profiles.
+- Reference: `references/risk_credit_changes.md`
+
+### stg_dca_collections_portfolio
+- Full name: `prod_analytics.prod_source.stg_dca_collections_portfolio`
+- Description: This is a **monthly incremental snapshot** of all accounts eligible for — or currently under — referral to a Debt Collection Agency (DCA). It is the single source of truth for monthly DCA referral decisions across all Australian Zip products.
+- Best for: Analyzing external collection agency's (DCA) collections performance and tracking delinquent accounts.
+- Reference: `references/stg_dca_collections_portfolio.md`
+
 ---
 
 ## Gocha

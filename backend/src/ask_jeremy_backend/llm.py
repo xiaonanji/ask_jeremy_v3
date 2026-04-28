@@ -74,6 +74,7 @@ class SkillAwareState(TypedDict, total=False):
     active_skill_names: list[str]
     active_skill_instructions: list[str]
     conversation_summary: str
+    requires_data_pipeline: bool
 
 
 class LangGraphChatClient:
@@ -400,26 +401,28 @@ class LangGraphChatClient:
 
         current_ids = list(state.get("active_skill_ids", []))
 
-        # Always include person-wiki-knowledge skill only for background/context questions.
-        always_active_skills = []
-        if context.person_wiki_root and not self._looks_like_data_request(latest_user_message):
-            wiki_skill = self.skill_catalog.get_by_name("person-wiki-knowledge")
-            if wiki_skill and wiki_skill.id not in current_ids:
-                always_active_skills.append(wiki_skill.id)
-
-        selected_ids = self._select_skill_ids_with_model(
+        classification = self._classify_turn_with_model(
             context=context,
             messages=messages,
             skills=available_skills,
             active_skill_ids=current_ids,
         )
+        selected_ids: list[str] = classification["skill_ids"]
+        requires_data_pipeline: bool = classification["requires_data_pipeline"]
+
+        # Always include person-wiki-knowledge skill only for background/context questions.
+        always_active_skills = []
+        if context.person_wiki_root and not requires_data_pipeline:
+            wiki_skill = self.skill_catalog.get_by_name("person-wiki-knowledge")
+            if wiki_skill and wiki_skill.id not in current_ids:
+                always_active_skills.append(wiki_skill.id)
 
         # Merge always-active skills with LLM-selected skills
         selected_ids = [*always_active_skills, *selected_ids]
         selected_ids = [skill_id for skill_id in selected_ids if skill_id not in current_ids]
         newly_selected = self.skill_activation.activate_by_ids(selected_ids)
         if not newly_selected and state.get("active_skill_instructions"):
-            return {}
+            return {"requires_data_pipeline": requires_data_pipeline}
 
         merged_ids = [*current_ids, *[skill.id for skill in newly_selected]]
         hydrated = self.skill_activation.hydrate(merged_ids)
@@ -455,15 +458,16 @@ class LangGraphChatClient:
             ]
             if hydrated
             else [],
+            "requires_data_pipeline": requires_data_pipeline,
         }
 
-    def _select_skill_ids_with_model(
+    def _classify_turn_with_model(
         self,
         context: GraphContext,
         messages: list[BaseMessage],
         skills,
         active_skill_ids: list[str],
-    ) -> list[str]:
+    ) -> dict[str, object]:
         selector_messages = [
             SystemMessage(content=self.skill_prompt_renderer.render_selection_instructions()),
             HumanMessage(
@@ -476,7 +480,7 @@ class LangGraphChatClient:
         ]
         response = self._get_model(context).invoke(selector_messages)
         response_text = self._message_text(response)
-        return self._parse_selected_skill_ids(response_text)
+        return self._parse_turn_classification(response_text)
 
     def _call_model(
         self,
@@ -494,7 +498,19 @@ class LangGraphChatClient:
                 ]
             }
 
-        messages = list(state["messages"])
+        all_messages = list(state["messages"])
+
+        # Separate any SystemMessages that ended up in the conversation history
+        # (e.g. from _enforce_data_pipeline) so they can be consolidated at the
+        # top of the prompt.  The Anthropic API rejects non-consecutive system
+        # messages.
+        messages: list[BaseMessage] = []
+        extra_system_messages: list[SystemMessage] = []
+        for msg in all_messages:
+            if isinstance(msg, SystemMessage):
+                extra_system_messages.append(msg)
+            else:
+                messages.append(msg)
 
         database_display = _database_display_name(context.database_backend)
 
@@ -529,6 +545,7 @@ class LangGraphChatClient:
             ),
             *summary_messages,
             *self._skill_prompt_messages(state),
+            *extra_system_messages,
             *messages,
         ]
         response = self._get_model(context).bind_tools(self._tools_for_turn(state)).invoke(prompt)
@@ -555,11 +572,12 @@ class LangGraphChatClient:
         self,
         state: SkillAwareState,
         runtime: Runtime[GraphContext],
-    ) -> dict[str, list[SystemMessage]]:
+    ) -> dict[str, list[HumanMessage]]:
         messages = state.get("messages", [])
         sql_artifact_id = self._latest_sql_artifact_id(messages)
         if sql_artifact_id:
             guidance = (
+                "[SYSTEM GUIDANCE] "
                 "This is a data-backed request. Do not answer yet. "
                 f"You already have raw SQL artifact `{sql_artifact_id}` for the current turn. "
                 "Write and run a Python analysis script with `run_analysis_script`. "
@@ -571,6 +589,7 @@ class LangGraphChatClient:
             )
         else:
             guidance = (
+                "[SYSTEM GUIDANCE] "
                 "This is a data-backed request. Do not answer yet. "
                 "Run `execute_sql_query`, then `run_analysis_script`, and answer only from the bounded analysis result returned by that tool. "
                 "The script must write its output to ANALYSIS_OUTPUT_PATH as JSON — do not print raw rows to stdout. "
@@ -579,7 +598,7 @@ class LangGraphChatClient:
                 "Generic shell and inline Python tools are unavailable for this turn. "
                 "If the request is ambiguous, ask a clarifying question instead of guessing."
             )
-        return {"messages": [SystemMessage(content=guidance)]}
+        return {"messages": [HumanMessage(content=guidance)]}
 
     def _route_after_model(self, state: SkillAwareState) -> str:
         messages = state.get("messages", [])
@@ -593,7 +612,7 @@ class LangGraphChatClient:
         if getattr(assistant_message, "tool_calls", None):
             return "tools"
 
-        if not self._requires_data_pipeline(messages):
+        if not self._requires_data_pipeline(state):
             return "end"
 
         if self._assistant_requests_clarification(assistant_message):
@@ -608,7 +627,7 @@ class LangGraphChatClient:
         return "end"
 
     def _tools_for_turn(self, state: SkillAwareState) -> list:
-        if not self._requires_data_pipeline(state.get("messages", [])):
+        if not self._requires_data_pipeline(state):
             return self._tools
         blocked_names = {"run_shell_command", "run_python_script"}
         return [
@@ -742,55 +761,13 @@ class LangGraphChatClient:
             None,
         )
 
-    def _requires_data_pipeline(self, messages: list[BaseMessage]) -> bool:
-        latest_user = next(
-            (
-                self._message_text(message)
-                for message in reversed(messages)
-                if isinstance(message, HumanMessage)
-            ),
-            "",
-        ).lower()
-        if not latest_user:
-            return False
-
+    def _requires_data_pipeline(self, state: SkillAwareState) -> bool:
+        messages = state.get("messages", [])
+        # Pipeline already in progress — keep enforcing
         if self._latest_sql_artifact_id(messages) or self._latest_analysis_result(messages):
             return True
-
-        return self._looks_like_data_request(latest_user)
-
-    def _looks_like_data_request(self, text: str) -> bool:
-        normalized = text.lower()
-        if not normalized:
-            return False
-
-        patterns = (
-            "how many",
-            "count",
-            "list",
-            "show",
-            "rank",
-            "top ",
-            "bottom ",
-            "distribution",
-            "average",
-            "sum",
-            "median",
-            "mean",
-            "compare",
-            "trend",
-            "school",
-            "student",
-            "award",
-            "database",
-            "table",
-            "dataset",
-            "sql",
-            "query",
-            "chart",
-            "plot",
-        )
-        return any(pattern in normalized for pattern in patterns)
+        # LLM classification from _select_skills
+        return state.get("requires_data_pipeline", False)
 
     def _assistant_requests_clarification(self, message: AIMessage) -> bool:
         text = self._message_text(message).lower()
@@ -1047,20 +1024,28 @@ class LangGraphChatClient:
         response = self._get_model(context).invoke(summary_prompt)
         return self._message_text(response)
 
-    def _parse_selected_skill_ids(self, response_text: str) -> list[str]:
+    def _parse_turn_classification(self, response_text: str) -> dict[str, object]:
         payload = self._extract_json_object(response_text)
         if payload is None:
-            return []
+            return {"skill_ids": [], "requires_data_pipeline": False}
 
         skill_ids = payload.get("skill_ids")
         if not isinstance(skill_ids, list):
-            return []
+            skill_ids = []
 
-        parsed: list[str] = []
+        parsed_ids: list[str] = []
         for item in skill_ids:
             if isinstance(item, str) and item.strip():
-                parsed.append(item.strip())
-        return parsed
+                parsed_ids.append(item.strip())
+
+        requires_data_pipeline = payload.get("requires_data_pipeline", False)
+        if not isinstance(requires_data_pipeline, bool):
+            requires_data_pipeline = False
+
+        return {
+            "skill_ids": parsed_ids,
+            "requires_data_pipeline": requires_data_pipeline,
+        }
 
     def _extract_json_object(self, value: str) -> dict[str, object] | None:
         stripped = value.strip()

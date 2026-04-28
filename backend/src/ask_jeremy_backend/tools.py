@@ -58,19 +58,6 @@ class LocalToolRegistry:
             timeout_seconds: int | None = None,
         ) -> str:
             """Run a local shell command. Use this for file search, repository inspection, and calling local CLIs. Prefer read-only commands unless the user explicitly asked to modify files."""
-            session_id = _session_id()
-            if _current_turn_requires_data_pipeline(settings, session_id):
-                return _format_process_result(
-                    {
-                        "exit_code": 1,
-                        "working_directory": workdir or str(settings.project_root),
-                        "stdout": "",
-                        "stderr": (
-                            "run_shell_command is disabled for database-backed turns. "
-                            "Use execute_sql_query, run_analysis_script, and read_analysis_result instead."
-                        ),
-                    }
-                )
             result = _run_process(
                 args=_shell_invocation(command),
                 settings=settings,
@@ -87,20 +74,6 @@ class LocalToolRegistry:
         ) -> str:
             """Run inline Python using the backend interpreter. Use this for quick structured parsing, calculations, and small local inspections. Save generated charts or files into the session artifacts directory exposed as the SESSION_ARTIFACTS_PATH environment variable. The tool returns JSON with exit_code, stdout, stderr, and detected artifacts."""
             session_id = _session_id()
-            if _current_turn_requires_data_pipeline(settings, session_id):
-                return json.dumps(
-                    {
-                        "exit_code": 1,
-                        "ok": False,
-                        "error_type": "tool_blocked",
-                        "recoverable": False,
-                        "message": (
-                            "run_python_script is disabled for database-backed turns. "
-                            "Use run_analysis_script so the analysis stays bounded and traceable."
-                        ),
-                    },
-                    indent=2,
-                )
             artifact_root = session_artifact_root(settings.session_root, session_id)
             before_snapshot = snapshot_artifacts(artifact_root)
             script_path = _write_python_code_artifact(
@@ -138,7 +111,7 @@ class LocalToolRegistry:
         def execute_sql_query(
             query: str,
         ) -> str:
-            """Execute a read-only SQL statement against the configured session database and save the raw result set as an internal artifact. Allowed statements: SELECT, WITH (CTEs), SHOW, DESCRIBE/DESC, EXPLAIN, LIST. Data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are prohibited. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
+            """Execute a SQL statement against the configured session database and save the raw result set as an internal artifact. Allowed statements: SELECT, WITH (CTEs), SHOW, DESCRIBE/DESC, EXPLAIN, LIST, and CREATE [OR REPLACE] TEMPORARY TABLE (for storing intermediate results). Non-temporary CREATE statements and other data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are prohibited. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
             session_id = _session_id()
             if not session_id:
                 return json.dumps(
@@ -660,64 +633,6 @@ def _format_process_result(result: dict[str, object]) -> str:
     if not stdout and not stderr:
         sections.append("No output.")
     return "\n\n".join(sections)
-
-
-def _current_turn_requires_data_pipeline(settings: Settings, session_id: str) -> bool:
-    latest_user_message = _latest_user_message(settings, session_id)
-    return _looks_like_data_request(latest_user_message)
-
-
-def _latest_user_message(settings: Settings, session_id: str) -> str:
-    if not session_id:
-        return ""
-    messages_path = settings.session_root / session_id / "messages.json"
-    if not messages_path.exists():
-        return ""
-    try:
-        payload = json.loads(messages_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, list):
-        return ""
-    for item in reversed(payload):
-        if isinstance(item, dict) and item.get("role") == "user":
-            content = item.get("content")
-            if isinstance(content, str):
-                return content
-    return ""
-
-
-def _looks_like_data_request(text: str) -> bool:
-    normalized = text.lower()
-    if not normalized:
-        return False
-    patterns = (
-        "how many",
-        "count",
-        "list",
-        "show",
-        "rank",
-        "top ",
-        "bottom ",
-        "distribution",
-        "average",
-        "sum",
-        "median",
-        "mean",
-        "compare",
-        "trend",
-        "school",
-        "student",
-        "award",
-        "database",
-        "table",
-        "dataset",
-        "sql",
-        "query",
-        "chart",
-        "plot",
-    )
-    return any(pattern in normalized for pattern in patterns)
 
 
 def _attach_sql_truncation_signal(

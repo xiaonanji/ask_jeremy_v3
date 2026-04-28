@@ -32,8 +32,18 @@ class SkillPromptRenderer:
             "You select which skills, if any, should be activated for the current user message.\n"
             "Choose only skills that are clearly relevant to the user's request.\n"
             "It is valid to choose no skills.\n"
-            "Do not activate untrusted project skills unless the user clearly asks for that skill or its domain.\n"
-            "Return strict JSON with this shape only: {\"skill_ids\": [\"skill-id-1\", \"skill-id-2\"]}."
+            "Do not activate untrusted project skills unless the user clearly asks for that skill or its domain.\n\n"
+            "You also classify whether the user's message requires the data pipeline.\n"
+            "Set \"requires_data_pipeline\" to true when the user is asking to query a database, "
+            "generate statistics or aggregations from data, produce charts/plots from data, "
+            "or otherwise analyse structured data (e.g. 'How many students received awards?', "
+            "'Show me a breakdown by school', 'Plot the trend of enrolments').\n"
+            "Set it to false for meta-questions about the conversation, general knowledge, "
+            "reviewing or summarising past work, clarification questions, greetings, or any "
+            "request that does not need to query or analyse a database "
+            "(e.g. 'Summarize what we found', 'What did the last analysis show?', 'Hello').\n\n"
+            "Return strict JSON with this shape only: "
+            "{\"skill_ids\": [\"skill-id-1\", \"skill-id-2\"], \"requires_data_pipeline\": true}."
         )
 
     def render_active_instructions(self, skills: list[ActivatedSkill]) -> str:
