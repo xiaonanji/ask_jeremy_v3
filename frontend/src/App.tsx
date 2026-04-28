@@ -6,9 +6,7 @@ import {
   type CSSProperties,
   memo,
   MouseEvent,
-  useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState
 } from "react";
@@ -2523,23 +2521,6 @@ function LogPanel({
   const steps = groupLogEntries(entries);
   const stepCount = steps.length;
 
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const savedScrollTop = useRef<number>(0);
-
-  const handleScroll = useCallback(() => {
-    if (scrollRef.current) {
-      savedScrollTop.current = scrollRef.current.scrollTop;
-    }
-  }, []);
-
-  // After DOM paint with new entries, restore scroll position
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (el) {
-      el.scrollTop = savedScrollTop.current;
-    }
-  }, [entries.length]);
-
   return (
     <>
       <div className="artifact-panel-header">
@@ -2551,7 +2532,7 @@ function LogPanel({
           Close
         </button>
       </div>
-      <div className="log-panel-scroll" ref={scrollRef} onScroll={handleScroll}>
+      <div className="log-panel-scroll">
         <div className="log-entry-stack">
           {steps.map((step, i) => {
             const key = step.type === "orphan" ? step.entry.id : `step-${i}`;
