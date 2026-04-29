@@ -65,7 +65,7 @@ Note that for each table below, there is a reference markdown file that provides
 ### dim_account
 - Full name: `prod_analytics.prod_prep.dim_account`
 - Description:  The **primary account dimension** in Zip's Snowflake analytics platform. It provides the **current state** of every account across all AU and NZ products (Zip Pay, Zip Money, Zip Plus, Zip Biz, Zip Personal Loan).
-- Best for: Get account-level information for a particular account.
+- Best for: Get account-level information for a particular account. This table can also be used to get customer-to-account relationships (e.g. linked accounts, parent/child accounts).
 - Reference: `references/dim_account.md`
 
 ### risk_credit_changes

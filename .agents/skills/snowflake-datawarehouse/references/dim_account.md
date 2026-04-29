@@ -198,6 +198,9 @@ ORDER BY product, delinquency_bucket;
 ```
 
 ### Find all accounts for a specific customer
+
+This table is able to get the customer-to-account mapping. Customers are identified by customer_id and accounts are identified by account_id. Both customer_id and account_id are presented in this table.
+
 ```sql
 SELECT
     account_id,
