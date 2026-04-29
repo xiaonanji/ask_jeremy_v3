@@ -26,6 +26,7 @@ from .database import (
     SqlQueryExecutor,
     WarehouseTablePolicyValidationError,
 )
+from .working_memory import make_memory_update
 
 _MAX_OUTPUT_CHARS = 8_000
 
@@ -358,6 +359,47 @@ class LocalToolRegistry:
             )
 
         @tool
+        def pin_working_memory(
+            section: str,
+            content: str,
+            source: str | None = None,
+            confidence: str = "medium",
+            mode: str = "append",
+        ) -> str:
+            """Pin critical task information so it survives long tool loops and conversation compaction. Use this when you learn durable information needed later in the same task: business rules, source summaries, warehouse mappings, failed attempts, blockers, open questions, current plan, or artifact notes. Valid sections: task_goal, loaded_sources, business_rules, warehouse_mapping, failed_attempts, open_questions, current_plan, artifacts, notes. `content` may be concise text or a JSON string. Use mode='replace' for current_plan or task_goal when replacing older content."""
+            try:
+                update = make_memory_update(
+                    section=section,
+                    content=content,
+                    source=source,
+                    confidence=confidence,
+                    pinned_by="llm",
+                    mode=mode,
+                )
+            except ValueError as exc:
+                return json.dumps(
+                    {
+                        "exit_code": 1,
+                        "ok": False,
+                        "error_type": "working_memory_error",
+                        "recoverable": True,
+                        "message": str(exc),
+                    },
+                    indent=2,
+                )
+
+            return json.dumps(
+                {
+                    "exit_code": 0,
+                    "ok": True,
+                    "tool_name": "pin_working_memory",
+                    "message": "Pinned information to task working memory.",
+                    "memory_update": update,
+                },
+                indent=2,
+            )
+
+        @tool
         def load_skill_reference(
             file_path: str,
         ) -> str:
@@ -437,6 +479,7 @@ class LocalToolRegistry:
             execute_sql_query,
             run_analysis_script,
             read_analysis_result,
+            pin_working_memory,
             load_skill_reference,
         ]
 

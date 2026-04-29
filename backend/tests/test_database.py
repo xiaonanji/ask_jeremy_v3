@@ -271,6 +271,38 @@ class SqlQueryExecutorTests(unittest.TestCase):
             self.assertIn("Blocked due to non-reference warehouse table", payload["message"])
             self.assertIn("not paired with data warehouse reference files", payload["message"])
 
+    def test_pin_working_memory_tool_returns_structured_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=root / "sessions",
+            )
+            tool = next(
+                item for item in LocalToolRegistry(settings).build() if item.name == "pin_working_memory"
+            )
+
+            payload = json.loads(
+                tool.invoke(
+                    {
+                        "section": "warehouse_mapping",
+                        "content": "{\"concept\":\"DPD snapshot\",\"table\":\"daily_summary\"}",
+                        "source": "snowflake-datawarehouse",
+                        "confidence": "high",
+                    },
+                    config={"configurable": {"thread_id": "session-1"}},
+                )
+            )
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["tool_name"], "pin_working_memory")
+            self.assertEqual(payload["memory_update"]["section"], "warehouse_mapping")
+            self.assertEqual(
+                payload["memory_update"]["item"]["content"]["concept"],
+                "DPD snapshot",
+            )
+
     def test_snowflake_blocks_information_schema_queries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -32,6 +32,12 @@ from .skills.prompting import SkillPromptRenderer
 from .mcp_tools import emit_custom_event, set_mcp_event_emitter
 from .tools import LocalToolRegistry
 from .warehouse_policy import snowflake_table_policy_prompt
+from .working_memory import (
+    apply_memory_update,
+    normalize_working_memory,
+    render_working_memory,
+    tool_payload_memory_updates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,7 @@ class SkillAwareState(TypedDict, total=False):
     active_skill_instructions: list[str]
     conversation_summary: str
     requires_data_pipeline: bool
+    working_memory: dict[str, object]
 
 
 class LangGraphChatClient:
@@ -410,6 +417,7 @@ class LangGraphChatClient:
         builder.add_node("compact_messages", self._compact_messages)
         builder.add_node("call_model", self._call_model)
         builder.add_node("tools", ToolNode(self._tools))
+        builder.add_node("update_working_memory", self._update_working_memory)
         builder.add_node("enforce_analysis", self._enforce_data_pipeline)
         builder.add_edge(START, "select_skills")
         builder.add_edge("select_skills", "compact_messages")
@@ -423,7 +431,8 @@ class LangGraphChatClient:
                 "end": END,
             },
         )
-        builder.add_edge("tools", "compact_messages")
+        builder.add_edge("tools", "update_working_memory")
+        builder.add_edge("update_working_memory", "compact_messages")
         builder.add_edge("enforce_analysis", "compact_messages")
         return builder.compile(checkpointer=checkpointer or self._checkpointer)
 
@@ -612,6 +621,11 @@ class LangGraphChatClient:
                 f"{summary}"
             ))]
 
+        working_memory_message = SystemMessage(content=(
+            "=== TASK WORKING MEMORY ===\n"
+            f"{render_working_memory(state.get('working_memory', {}))}"
+        ))
+
         prompt = [
             SystemMessage(
                 content=(
@@ -634,6 +648,7 @@ class LangGraphChatClient:
                 )
             ),
             *summary_messages,
+            working_memory_message,
             *self._skill_prompt_messages(state),
             *extra_system_messages,
             *messages,
@@ -689,6 +704,61 @@ class LangGraphChatClient:
                 "If the request is ambiguous, ask a clarifying question instead of guessing."
             )
         return {"messages": [HumanMessage(content=guidance)]}
+
+    def _update_working_memory(
+        self,
+        state: SkillAwareState,
+        runtime: Runtime[GraphContext],
+    ) -> dict[str, object]:
+        memory = normalize_working_memory(state.get("working_memory", {}))
+        changed = False
+
+        for message in self._messages_since_latest_human(state.get("messages", [])):
+            if not isinstance(message, ToolMessage):
+                continue
+            content = self._message_text(message)
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            tool_name = str(getattr(message, "name", "") or "")
+            for update in tool_payload_memory_updates(
+                tool_name=tool_name,
+                payload=payload,
+            ):
+                memory, update_changed = apply_memory_update(memory, update)
+                changed = changed or update_changed
+
+        if not changed:
+            return {}
+
+        self._write_working_memory_file(runtime.context, memory)
+        emitter = getattr(self, "_stream_emit", None)
+        item_count = sum(len(items) for items in memory.values())
+        event = {
+            "type": "working_memory_updated",
+            "item_count": item_count,
+        }
+        if emitter is not None:
+            emitter(event)
+        else:
+            emit_custom_event(event)
+        return {"working_memory": memory}
+
+    def _write_working_memory_file(
+        self,
+        context: GraphContext,
+        memory: dict[str, object],
+    ) -> None:
+        try:
+            workspace_path = Path(context.workspace_path)
+            workspace_path.mkdir(parents=True, exist_ok=True)
+            (workspace_path / "working_memory.json").write_text(
+                json.dumps(memory, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("Failed to persist task working memory file.", exc_info=True)
 
     def _route_after_model(self, state: SkillAwareState) -> str:
         messages = state.get("messages", [])
