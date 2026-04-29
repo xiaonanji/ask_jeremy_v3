@@ -31,6 +31,7 @@ from .skills.parser import SkillParser
 from .skills.prompting import SkillPromptRenderer
 from .mcp_tools import emit_custom_event, set_mcp_event_emitter
 from .tools import LocalToolRegistry
+from .warehouse_policy import snowflake_table_policy_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -595,6 +596,12 @@ class LangGraphChatClient:
         messages = _sanitize_tool_message_pairs(messages)
 
         database_display = _database_display_name(context.database_backend)
+        warehouse_policy = ""
+        if context.database_backend == "snowflake":
+            warehouse_policy = (
+                "\n\n=== SNOWFLAKE REFERENCED TABLE POLICY ===\n"
+                f"{snowflake_table_policy_prompt(self.settings.project_skill_root)}"
+            )
 
         summary = state.get("conversation_summary", "")
         summary_messages: list[SystemMessage] = []
@@ -623,6 +630,7 @@ class LangGraphChatClient:
                     f"Do not mix in syntax from other SQL dialects. If you are unsure whether a "
                     f"function or clause exists in {database_display}, use a form you are confident "
                     f"is supported there, or consult {database_display} documentation conventions."
+                    f"{warehouse_policy}"
                 )
             ),
             *summary_messages,

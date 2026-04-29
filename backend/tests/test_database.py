@@ -14,7 +14,46 @@ from ask_jeremy_backend.tools import LocalToolRegistry
 from ask_jeremy_backend.verification import verify_answer_against_analysis
 
 
+class RecordingSnowflakeExecutor(SqlQueryExecutor):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.executed_queries: list[str] = []
+
+    def _execute_snowflake(self, query: str) -> tuple[list[str], list[dict[str, object]], bool]:
+        self.executed_queries.append(query)
+        return ["ok"], [{"ok": True}], False
+
+
 class SqlQueryExecutorTests(unittest.TestCase):
+    def _write_referenced_warehouse_skill(self, root: Path) -> Path:
+        skill_root = root / "skills"
+        skill_dir = skill_root / "snowflake-datawarehouse"
+        reference_dir = skill_dir / "references"
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        (reference_dir / "daily_summary.md").write_text(
+            "# Daily Summary\n",
+            encoding="utf-8",
+        )
+        (reference_dir / "dim_account.md").write_text(
+            "# Dim Account\n",
+            encoding="utf-8",
+        )
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join(
+                [
+                    "## Key Tables in the Data Warehouse",
+                    "### stg_batchoperations_account_daily_summary",
+                    "- Full name: `prod_analytics.prod_source.stg_batchoperations_account_daily_summary`",
+                    "- Reference: `references/daily_summary.md`",
+                    "### dim_account",
+                    "- Full name: `prod_analytics.prod_prep.dim_account`",
+                    "- Reference: `references/dim_account.md`",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return skill_root
+
     def test_sqlite_query_is_materialized_to_session_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -84,6 +123,206 @@ class SqlQueryExecutorTests(unittest.TestCase):
             with self.assertRaises(QueryValidationError):
                 executor.execute_query(
                     query="delete from metrics",
+                    session_id="session-1",
+                )
+
+    def test_snowflake_rejects_unreferenced_tables_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            with self.assertRaises(QueryValidationError) as context:
+                executor.execute_query(
+                    query="select * from prod_analytics.prod_source.stg_zmdb_consumeraccount",
+                    session_id="session-1",
+                )
+
+            self.assertIn("Blocked due to non-reference warehouse table", str(context.exception))
+            self.assertEqual(executor.executed_queries, [])
+
+    def test_snowflake_allows_referenced_tables_and_ctes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            result = executor.execute_query(
+                query=(
+                    "with base as ("
+                    "select account_id "
+                    "from prod_analytics.prod_source.stg_batchoperations_account_daily_summary"
+                    ") "
+                    "select count(*) as row_count from base"
+                ),
+                session_id="session-1",
+            )
+
+            self.assertEqual(result.database, "snowflake")
+            self.assertEqual(result.row_count, 1)
+            self.assertEqual(len(executor.executed_queries), 1)
+
+    def test_snowflake_policy_does_not_treat_scalar_extract_from_as_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            result = executor.execute_query(
+                query=(
+                    "select extract(day from snapshot_date) as day_number "
+                    "from prod_analytics.prod_source.stg_batchoperations_account_daily_summary"
+                ),
+                session_id="session-1",
+            )
+
+            self.assertEqual(result.database, "snowflake")
+            self.assertEqual(len(executor.executed_queries), 1)
+
+    def test_snowflake_blocks_catalog_search_statements(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            with self.assertRaises(QueryValidationError) as context:
+                executor.execute_query(
+                    query="show tables like '%consumer%'",
+                    session_id="session-1",
+                )
+
+            self.assertIn("SHOW and LIST statements can search", str(context.exception))
+            self.assertEqual(executor.executed_queries, [])
+
+    def test_tool_returns_clear_policy_error_for_non_reference_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1" / "artifacts").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            tool = next(
+                item for item in LocalToolRegistry(settings).build() if item.name == "execute_sql_query"
+            )
+
+            payload = json.loads(
+                tool.invoke(
+                    {"query": "select * from prod_analytics.prod_source.stg_zmdb_consumeraccount"},
+                    config={"configurable": {"thread_id": "session-1"}},
+                )
+            )
+
+            self.assertEqual(payload["exit_code"], 1)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error_type"], "warehouse_table_policy_error")
+            self.assertFalse(payload["recoverable"])
+            self.assertIn("Blocked due to non-reference warehouse table", payload["message"])
+            self.assertIn("not paired with data warehouse reference files", payload["message"])
+
+    def test_snowflake_blocks_information_schema_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            with self.assertRaises(QueryValidationError) as context:
+                executor.execute_query(
+                    query="select table_name from prod_analytics.information_schema.tables",
+                    session_id="session-1",
+                )
+
+            self.assertIn("information_schema.tables", str(context.exception).lower())
+            self.assertEqual(executor.executed_queries, [])
+
+    def test_snowflake_describe_requires_referenced_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "sessions"
+            (session_root / "session-1").mkdir(parents=True, exist_ok=True)
+            (session_root / "session-1" / "metadata.json").write_text(
+                json.dumps({"database_backend": "snowflake"}),
+                encoding="utf-8",
+            )
+            settings = Settings(
+                _env_file=None,
+                project_root=root,
+                session_root=session_root,
+                project_skill_root=self._write_referenced_warehouse_skill(root),
+            )
+            executor = RecordingSnowflakeExecutor(settings)
+
+            result = executor.execute_query(
+                query="desc table prod_analytics.prod_prep.dim_account",
+                session_id="session-1",
+            )
+            self.assertEqual(result.row_count, 1)
+
+            with self.assertRaises(QueryValidationError):
+                executor.execute_query(
+                    query="desc table prod_analytics.prod_source.missing_reference",
                     session_id="session-1",
                 )
 

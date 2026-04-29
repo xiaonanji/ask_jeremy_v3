@@ -24,6 +24,7 @@ from .database import (
     DatabaseConnectorError,
     QueryValidationError,
     SqlQueryExecutor,
+    WarehouseTablePolicyValidationError,
 )
 
 _MAX_OUTPUT_CHARS = 8_000
@@ -111,7 +112,7 @@ class LocalToolRegistry:
         def execute_sql_query(
             query: str,
         ) -> str:
-            """Execute a SQL statement against the configured session database and save the raw result set as an internal artifact. Allowed statements: SELECT, WITH (CTEs), SHOW, DESCRIBE/DESC, EXPLAIN, LIST, and CREATE [OR REPLACE] TEMPORARY TABLE (for storing intermediate results). Non-temporary CREATE statements and other data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are prohibited. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
+            """Execute a SQL statement against the configured session database and save the raw result set as an internal artifact. Allowed statements: SELECT, WITH (CTEs), DESCRIBE/DESC, EXPLAIN, and CREATE [OR REPLACE] TEMPORARY TABLE (for storing intermediate results). Non-temporary CREATE statements and other data-modifying statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.) are prohibited. For Snowflake, this tool only allows tables explicitly paired with reference files in the snowflake-datawarehouse skill; SHOW/LIST and warehouse catalog exploration are blocked. Do not rely on this tool alone for user-facing answers; follow it with `run_analysis_script` and `read_analysis_result`."""
             session_id = _session_id()
             if not session_id:
                 return json.dumps(
@@ -565,6 +566,13 @@ def _classify_sql_tool_error(exc: DatabaseConnectorError) -> SqlToolError:
     if isinstance(exc, DatabaseConfigurationError):
         return SqlToolError(
             error_type="database_connection_error",
+            recoverable=False,
+            message=message,
+        )
+
+    if isinstance(exc, WarehouseTablePolicyValidationError):
+        return SqlToolError(
+            error_type="warehouse_table_policy_error",
             recoverable=False,
             message=message,
         )

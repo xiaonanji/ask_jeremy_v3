@@ -23,6 +23,14 @@ Also notice that some table reference markdown file also provides a Table Schema
 
 ---
 
+## Hard table policy
+
+Only use tables that are explicitly listed in the "Key Tables in the Data Warehouse" section below and have an existing reference markdown file.
+
+Do not search for or discover additional warehouse tables with SHOW, LIST, INFORMATION_SCHEMA, ACCOUNT_USAGE, naming guesses, or inferred table names. If none of the referenced tables covers the requested business logic, ask the user which table reference should be added or confirmed.
+
+---
+
 ## Key Tables in the Data Warehouse
 
 Note that for each table below, there is a reference markdown file that provides more detailed information about the table, including its schema, key columns, and example queries. You should dynamically refer to the needed markdown files for a deeper understanding of the target table and how to use it effectively in your analysis.

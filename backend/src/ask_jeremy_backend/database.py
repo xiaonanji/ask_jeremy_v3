@@ -14,6 +14,10 @@ from uuid import uuid4
 
 from .config import Settings
 from .schemas import DatabaseBackend
+from .warehouse_policy import (
+    WarehouseTablePolicyError,
+    validate_snowflake_table_policy,
+)
 
 _QUERY_TAG = "ask_jeremy_sql_connector"
 
@@ -33,6 +37,10 @@ class DatabaseConfigurationError(DatabaseConnectorError):
 
 class QueryValidationError(DatabaseConnectorError):
     """Raised when a query violates the connector safety contract."""
+
+
+class WarehouseTablePolicyValidationError(QueryValidationError):
+    """Raised when Snowflake SQL uses a table outside the reference set."""
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,13 @@ class SqlQueryExecutor:
         if normalized_database == "sqlite":
             columns, rows, truncated = self._execute_sqlite(executed_query)
         elif normalized_database == "snowflake":
+            try:
+                validate_snowflake_table_policy(
+                    executed_query,
+                    self.settings.project_skill_root,
+                )
+            except WarehouseTablePolicyError as exc:
+                raise WarehouseTablePolicyValidationError(str(exc)) from exc
             columns, rows, truncated = self._execute_snowflake(executed_query)
         else:
             raise DatabaseConfigurationError(
