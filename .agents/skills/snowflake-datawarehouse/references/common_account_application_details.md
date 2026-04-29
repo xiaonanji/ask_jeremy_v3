@@ -1,5 +1,3 @@
-# Agent Skill: `PROD_ANALYTICS.PROD_MART.COMMON_ACCOUNT_APPLICATION_DETAILS`
-
 ## Overview
 
 `PROD_MART.COMMON_ACCOUNT_APPLICATION_DETAILS` is the **central AU application-level mart table** — one row per consumer that has started an application. It combines application metadata, underwriting decisions, credit bureau data, banking statement features, account lifecycle metrics, and cross-product behavioural signals into a single wide table.
@@ -8,11 +6,6 @@
 |---|---|
 | **Full path** | `PROD_ANALYTICS.PROD_MART.COMMON_ACCOUNT_APPLICATION_DETAILS` |
 | **Grain** | One row per `consumer_id` (unique, not null) |
-| **Materialization** | `table` (full rebuild each run) |
-| **Warehouse** | `ZIP_PROD_INTERNAL_DB_LARGE_WH` |
-| **Owner** | ANZ Risk Management & Data Science |
-| **Scope** | AU only — use `COMMON_ACCOUNT_APPLICATION_DETAILS_NZ` for New Zealand |
-| **dbt source** | [`zip-au/product-analytics/dbt-cloud — models/mart/common/common_account_application_details.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/common/common_account_application_details.sql) |
 
 > **All applications that were ever started are included**, not just approved or registered ones. Use `flag_*` and timestamp columns to filter to the population you need.
 
@@ -548,18 +541,13 @@ WHERE email_address = 'customer@example.com'
 
 | Join target | Join key | Notes |
 |---|---|---|
-| `PROD_MART.COMMON_ACCOUNT_DAILY_SUMMARY` | `account_id` | Daily account balance, arrears, repayment data. |
-| `PROD_MART.COMMON_ACCOUNT_MONTHLY_SUMMARY` | `account_id` | Month-end account metrics. |
-| `PROD_MART.COMMON_CUSTOMER_SUMMARY` | `customer_id` | Customer-level demographics and lifecycle. |
 | `PROD_PREP.DIM_ACCOUNT_APPLICATION` | `application_id` | Per-application granularity (if needed). |
-| `PROD_PREP.FCT_TRANSACTION` | `account_id` | Individual transaction history. |
 | `PROD_PREP.FCT_ORDER` | `account_id` | Order-level data. |
-| `PROD_PREP.DIM_MERCHANT` | `origination_merchant_id` | Merchant details. |
 
 ---
 
 
-## Real-World Usage Patterns (from `zip-au/data-science/crcautomation`)
+## Real-World Usage Patterns
 
 ### Approval rate by product and month
 
@@ -659,22 +647,3 @@ ORDER BY 1, 2
 10. **`ECL`, `net_balance_for_ecl`, `ecl_date`** reflect the most recent ECL model run, which may lag by up to one day.
 
 11. **The table is materialised as a full table rebuild** on a large warehouse. For exploratory work, add `LIMIT` clauses or filter by `application_timestamp` to avoid full-table scans.
-
----
-
-## Upstream Sources (dbt refs)
-
-The model joins **56 upstream tables**, including:
-
-| Layer | Key tables |
-|---|---|
-| **Dim** | `dim_account_application`, `dim_account`, `dim_merchant`, `dim_account_attribution`, `dim_application_attribution`, `dim_application_banking_features`, `dim_application_decisioning_features`, `dim_credit_profile_current_state`, `dim_veda_summary`, `dim_xth_order` |
-| **Fact** | `fct_transaction`, `fct_order`, `fct_account_fee`, `fct_repayment`, `fct_disbursements_event`, `fct_credit_limit_history` |
-| **Underwriting** | `dim_underwriting_bscore`, `dim_underwriting_bscore_clv`, `dim_underwriting_capacity`, `dim_underwriting_bank_model_validation`, `dim_underwriting_zp_app_model_validation`, `dim_underwriting_zm_app_model_validation`, `dim_underwriting_decline_rule_results` |
-| **Staging** | `stg_zmdb_credit_profile`, `stg_zmdb_consumer_application`, `stg_zmdb_credit_profile_state`, `stg_decisioning_credit_policy`, `stg_decisioning_decision_rule_result`, `stg_origination_funnel_status_changed_analytics`, `stg_re_aged_accounts`, `stg_zmdb_account_summary`, `stg_vcn_card_state` |
-| **Prep** | `prep_veda_credit_enquiry`, `prep_verification_result_veda`, `prep_common_account_application_veda_xml`, `prep_common_account_application_tlu_def` |
-| **Risk** | `risk_account_expected_credit_loss_monthly`, `tableau_credit_limit_increase` |
-
----
-
-*Sources: [dbt SQL](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/common/common_account_application_details.sql) · [Schema YAML](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/common/common_account_application_details.yml) · [dbt doc](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/common/common_account_application_details.md)*

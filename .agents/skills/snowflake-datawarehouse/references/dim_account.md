@@ -7,10 +7,6 @@
 - **Grain:** One row per `account_id` — current snapshot only (not historical)
 - **Primary Key:** `account_id` (unique, not null)
 - **Refresh cadence:** Hourly (`hourly_run` dbt tag)
-- **dbt model:** [`zip-au/product-analytics/dbt-cloud — models/prep/dim/dim_account.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/prep/dim/dim_account.sql)
-- **Schema contract:** [`dim_account.contracts.yml`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/prep/dim/dim_account.contracts.yml)
-
-> ⚠️ This is a **current-state** table. For historical state, use `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_HISTORY` (SCD Type II) only when explicitly asked about point-in-time snapshots.
 
 ---
 
@@ -201,7 +197,7 @@ GROUP BY product, delinquency_bucket
 ORDER BY product, delinquency_bucket;
 ```
 
-### Find all accounts for a specific consumer
+### Find all accounts for a specific customer
 ```sql
 SELECT
     account_id,
@@ -210,7 +206,7 @@ SELECT
     credit_limit,
     registration_timestamp
 FROM PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT
-WHERE consumer_id = <consumer_id>;
+WHERE customer_id = <customer_id>;
 ```
 
 ### Accounts opened in the last 30 days
@@ -256,26 +252,9 @@ WHERE hardship_flag = 1
 
 ---
 
-## Related Tables
-
-| Table | Description |
-|---|---|
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_APPLICATION` | Application-level dimension — includes both approved and **declined** applications; contains `APPLICATION_TIMESTAMP`, `APPROVED_TIMESTAMP`, `DECLINED_TIMESTAMP` |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_APPLICATION_ANZ` | Combined AU + NZ account application dimension |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_ATTRIBUTION` | Origination attribution dimension — inferred origination merchant/branch and origination method |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_ACTIVITY_SEGMENT` | Activity segmentation flags per account |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_MONTHLY_SUMMARY` | Monthly account-level summary metrics |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_MONTHLY_FLAGS` | Monthly boolean flags per account |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_PAYMENT_METHOD` | Payment methods linked to accounts |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_TYPE` | Lookup for account type metadata and fees |
-| `PROD_ANALYTICS.PROD_PREP.DIM_MERCHANT` | Merchant dimension — join on `origination_merchant_id` or `first_merchant_id` |
-| `PROD_ANALYTICS.PROD_PREP.DIM_ACCOUNT_NZ` | NZ-only account dimension |
-
----
-
 ## Key Caveats & Gotchas
 
-1. **Current state only.** This table reflects the account's state _right now_. Do not use for point-in-time analysis — use `DIM_ACCOUNT_HISTORY` (SCD II) only if historical snapshots are explicitly required.
+1. **Current state only.** This table reflects the account's state _right now_.
 
 2. **`account_status = 0` is excluded.** The SQL model filters out `account_status <> 0` from the source staging table. These are effectively invalid/ghost records.
 
@@ -296,35 +275,3 @@ WHERE hardship_flag = 1
 10. **`consumer_attributes` is an ARRAY type.** Use `ARRAY_CONTAINS('value'::VARIANT, consumer_attributes)` to filter by specific attribute. Do not use `=` or `LIKE`.
 
 11. **Product mapping uses `QUALIFY` for deduplication.** When an account type's `reference_code` matches the product mapping, that row wins over a generic match — this prevents duplicate rows per account.
-
----
-
-## Source Tables (dbt Lineage)
-
-```
-stg_zmdb_account                → Core account record
-stg_zmdb_consumer               → Consumer/customer details
-stg_zmdb_consumer_account       → Consumer ↔ account link
-stg_zmdb_consumer_application   → Originating application
-stg_zmdb_account_type           → Account type, fees
-stg_zmdb_credit_profile         → Credit limit
-stg_zmdb_credit_profile_state   → Open/close timestamps
-stg_zmdb_credit_profile_state_history → Z+ migration detection
-stg_zmdb_transaction_history    → (via dim_xth_order) First transaction
-stg_zmdb_consumer_attribute     → Write-off detection
-stg_zmdb_consumer_attribute_history → Hardship flags
-stg_batchoperations_account_daily_summary → Arrears & balance
-stg_zmdb_address                → Residential address
-stg_zmdb_consumer_address       → Consumer ↔ address link
-stg_zmdb_phone                  → Phone number
-stg_zmdb_consumer_phone         → Consumer ↔ phone link
-stg_zmdb_consumer_name          → Name (active)
-stg_zmdb_repayment              → Repayment schedule
-stg_zmdb_account_configuration  → Instalment flag
-stg_zmdb_funding_program        → Funding program
-stg_re_aged_accounts            → Re-age events
-map_consumer_to_consumer_attribute → Active attribute flags
-map_product_classifications     → product / product_group labels
-dim_merchant                    → Merchant details (origination + first)
-dim_xth_order                   → First transaction details
-```

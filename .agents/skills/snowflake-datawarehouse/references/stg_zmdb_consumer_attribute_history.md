@@ -1,5 +1,3 @@
-# Agent Skill: `PROD_SOURCE.STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY`
-
 ## Overview
 
 `PROD_ANALYTICS.PROD_SOURCE.STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY` is an **SCD Type 2 (Slowly Changing Dimension)** staging table that tracks the full historical record of attributes assigned to consumers in the ZipMoney platform (ZMDB). It is built from the source `zm_consumerattribute` table via Airbyte CDC, and is refreshed **hourly**.
@@ -18,11 +16,7 @@ Use this table when you need **point-in-time** or **historical** attribute analy
 | **Full Reference** | `PROD_ANALYTICS.PROD_SOURCE.STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY` |
 | **Primary Key** | `ID` |
 | **SCD2 Unique Key** | `SCD_ID` |
-| **Source System** | ZMDB (`zm_consumerattribute`) via Airbyte CDC |
 | **Refresh Frequency** | Hourly |
-| **Owner** | ANZ Customer Core team |
-| **dbt Repository** | [`zip-au/product-analytics/dbt-cloud`](https://gitlab.com/zip-au/product-analytics/dbt-cloud) |
-| **dbt Model Path** | `models/source/zmdb/stg_zmdb_consumer_attribute_history.sql` |
 
 ---
 
@@ -191,30 +185,6 @@ WHERE ca.attribute_id IN (1, 2);
 
 ---
 
-## Table Relationships
-
-```
-STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY
-    │
-    ├── CONSUMER_ID ──► STG_ZMDB_CONSUMER (consumer profile, trust score)
-    │                       │
-    │                       └── via STG_ZMDB_CONSUMERACCOUNT ──► STG_ZMDB_ACCOUNT (account_id)
-    │
-    └── ATTRIBUTE_ID ──► STG_ZMDB_ATTRIBUTE (name, category, type)
-```
-
-**Key related tables:**
-
-| Table | Join Key | Purpose |
-|---|---|---|
-| `STG_ZMDB_ATTRIBUTE` | `ATTRIBUTE_ID = STG_ZMDB_ATTRIBUTE.ID` | Decode attribute ID into name/category/type |
-| `STG_ZMDB_CONSUMER` | `CONSUMER_ID = STG_ZMDB_CONSUMER.ID` | Consumer profile, trust score, application ID |
-| `STG_ZMDB_CONSUMERACCOUNT` | `CONSUMER_ID = STG_ZMDB_CONSUMERACCOUNT.CONSUMER_ID` | Bridge table to get `ACCOUNT_ID` |
-| `STG_ZMDB_CONSUMER_ATTRIBUTE` | Same keys | Current-state view of this history table |
-| `PROD_PREP.MAP_CONSUMER_TO_CONSUMER_ATTRIBUTE` | `CONSUMER_ID` | Enriched mapping: attribute + account + customer, includes derived flags (write-off, collector referred, bscore indicators) |
-
----
-
 ## Current State vs History — Which to Use?
 
 | Use Case | Table to Use |
@@ -229,58 +199,6 @@ STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY
 
 ---
 
-## Data Pipeline
-
-```
-ZMDB (SQL Server: zm_consumerattribute)
-    → Airbyte CDC (hourly, captures INSERT / UPDATE / DELETE)
-    → PROD_RAW.prod_airbyte."PROD_AIRBYTE_raw__stream_zipmoney_ConsumerAttribute"
-    → dbt incremental model (scd2_zip_v1 macro)
-    → PROD_ANALYTICS.PROD_SOURCE.STG_ZMDB_CONSUMER_ATTRIBUTE_HISTORY
-    → PROD_ANALYTICS.PROD_SOURCE.STG_ZMDB_CONSUMER_ATTRIBUTE (view, current records only)
-    → PROD_ANALYTICS.PROD_PREP.MAP_CONSUMER_TO_CONSUMER_ATTRIBUTE
-```
-
-The SCD2 model uses the `scd2_zip_v1` and `scd2_temp_table_version_zip_v1` dbt macros. On incremental runs, only the `valid_to` column is merged to close out superseded records.
-
----
-
-## dbt Model Source (for reference)
-
-```sql
--- models/source/zmdb/stg_zmdb_consumer_attribute_history.sql
-{{
-    config(
-        snowflake_warehouse = assign_warehouse('ZIP_PROD_INTERNAL_DB_SMALL_WH'),
-        pre_hook= "{{ scd2_prehook_zip_v1(model=source('airbyte_zip','zm_consumer_attribute'),table_name='ConsumerAttribute',pkeys=['id']) }}",
-        tags=["hourly_sync_to_databricks"],
-        materialized="incremental",
-        unique_key="scd_id",
-        merge_update_columns=["valid_to"]
-    )
-}}
-
-{% if is_incremental() %}
-{{
-    scd2_temp_table_version_zip_v1(
-        model=source("airbyte_zip", "zm_consumer_attribute"),
-        table_name="ConsumerAttribute",
-        pkeys=["id"],
-    )
-}}
-{% else %}
-{{
-    scd2_zip_v1(
-        model=source("airbyte_zip", "zm_consumer_attribute"),
-        table_name="ConsumerAttribute",
-        pkeys=["id"],
-    )
-}}
-{% endif %}
-```
-
----
-
 ## Gotchas & Best Practices
 
 1. **`VALID_TO = '9999-12-31'`, not NULL** — current records use the sentinel `9999-12-31`, not a null. Filtering `VALID_TO IS NULL` will return nothing.
@@ -290,13 +208,3 @@ The SCD2 model uses the `scd2_zip_v1` and `scd2_temp_table_version_zip_v1` dbt m
 5. **Prefer the view for current-state queries** — `STG_ZMDB_CONSUMER_ATTRIBUTE` pre-applies the correct `VALID_TO` and CDC deleted-at filters. Use the history table only when you need time-travel.
 6. **Use `MAP_CONSUMER_TO_CONSUMER_ATTRIBUTE` for enriched data** — if you need attribute data joined to account/customer context or derived flags (write-off, bscore, collector referred), use this `PROD_PREP` model instead of joining yourself.
 7. **This is a PROD_SOURCE table** — no business-rule transforms are applied here. For curated, rule-applied models, look upstream in `PROD_PREP`.
-
----
-
-## References
-
-- [Important Tables Used In Snowflake (Confluence)](https://zip-co.atlassian.net/wiki/spaces/AFA/pages/3315662867/Important+Tables+Used+In+Snowflake)
-- [Datalake Profile — ERD & Table Descriptions (Confluence)](https://zip-co.atlassian.net/wiki/spaces/ZDA/pages/2357560136/Datalake+Profile)
-- [dbt 101 - Database and Model Architecture (Confluence)](https://zip-co.atlassian.net/wiki/spaces/PA/pages/2478440551/dbt+101+-+Database+and+Model+Architecture)
-- [dbt Model Source (GitLab)](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/source/zmdb/stg_zmdb_consumer_attribute_history.sql)
-- [dbt Model YAML (GitLab)](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/source/zmdb/stg_zmdb_consumer_attribute_history.yml)

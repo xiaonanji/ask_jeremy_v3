@@ -6,10 +6,8 @@
 
 It is the authoritative source for risk teams and data science models to analyse credit limit change patterns, and is a key feature input into behavioural scoring, DPD recovery, and debt collection referral models.
 
-- **dbt model:** [`models/mart/risk/risk_credit_changes.sql`]
 - **Materialization:** Table
 - **Refresh cadence:** Daily at 14:00 UTC (`tags: daily_run`)
-- **Airflow DAG:** `de-openmeta-dbt-ingestion`
 - **Row grain:** One row per credit limit change event per account
 
 ---
@@ -55,34 +53,6 @@ The `cl_category` column is derived by parsing the `crm_comment` / `submit_appro
 | `99.Others` | Unknown | Could not be mapped to any of the above categories |
 
 > **Compulsory CLDs** (categories `02`–`06`) are the most used risk signal. Downstream models typically filter `cl_category IN ('02.Backbook CLD', '03.Dormancy CLD', '05.Bureau wash CLD', '06.Risk driven compulsory CLD')` over a 12-month lookback window.
-
----
-
-## Data Lineage
-
-### Upstream Sources
-
-```
-stg_zmdb_credit_profile_limit_update       ─┐
-stg_zmdb_credit_profile_limit_update_status─┤
-stg_zmdb_credit_profile                    ─┤──► risk_credit_changes
-stg_zmdb_consumer                          ─┤
-dim_account                                ─┤
-risk_cld_permanent_batch                   ─┤
-risk_cld_bau_holdouts                      ─┤
-stg_s3_cld_backbook_holdout                ─┘
-```
-
-### Downstream Consumers
-
-| Consumer | Repo | Usage |
-|---|---|---|
-| ZipPay Behavioural Score (`dataprep.py`) | `databricks-notebooks-e2` | Compulsory CLD flag (L12M) as scoring feature |
-| ZipMoney Behavioural Score (`modelscoring.py`) | `databricks-notebooks-e2` | Compulsory CLD flag + most recent CLI date (L12M) |
-| ZipMoney 31–60 DPD Recovery Model | `databricks-notebooks-e2` | CLD history as delinquency predictor feature |
-| ZipMoney 61–90 DPD Recovery Model | `databricks-notebooks-e2` | CLD history as delinquency predictor feature |
-| ZipMoney 91–180 DPD Recovery Model | `databricks-notebooks-e2` | CLD history as delinquency predictor feature |
-| DCA Referral Model | `databricks-notebooks-e2` | Historical CLD patterns in referral decision |
 
 ---
 

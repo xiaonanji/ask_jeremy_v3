@@ -14,7 +14,7 @@ To get unique CLI requests, use:
 ```sql
 SELECT DISTINCT 
     credit_profile_limit_update_id
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting;
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting;
 ```
 
 ---
@@ -70,7 +70,7 @@ SELECT
     cl_category,
     COUNT(distinct cli_id) as cli_count,
     SUM(requested_credit_limit - initial_credit_limit) as total_increase_requested
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting
 GROUP BY 1, 2
 ORDER BY 1 DESC, 2;
 ```
@@ -85,7 +85,7 @@ SELECT
     COUNT(distinct case when flag_auto_decisioned = 1 then cli_id end) as auto_decisions,
     COUNT(distinct case when flag_manual_decisioned = 1 then cli_id end) as manual_decisions,
     ROUND(100.0 * auto_decisions / COUNT(distinct cli_id), 2) as auto_decision_rate_pct
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting
 where flag_pending = 0
 GROUP BY 1
 ORDER BY 1 DESC;
@@ -99,7 +99,7 @@ SELECT
     status_str,
     COUNT(distinct cli_id) as rule_executions,
     AVG(rule_score) as avg_score
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting
 WHERE rule_name IS NOT NULL
 GROUP BY 1, 2
 ORDER BY 3 DESC;
@@ -114,7 +114,7 @@ SELECT
     COUNT(distinct cli_id) as total_applications,
     COUNT(distinct case when flag_approved = 1 then cli_id end) as approved_count,
     ROUND(100.0 * COUNT(case when flag_approved = 1 then cli_id end) / COUNT(distinct cli_id), 2) as approval_rate_pct
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting
 GROUP BY 1, 2
 ORDER BY 1, 2;
 ```
@@ -127,6 +127,6 @@ SELECT
     count(distinct case when flag_approved = 1 then cli_id end) as num_applications_approved,
     count(distinct case when flag_declined = 1 then cli_id end) as num_applications_declined,
     COUNT(distinct cli_id) as num_applications_total
-FROM PROD_ANALYTICS.prod_MART.zm_cli_daily_monitoring_reporting
+FROM prod_analytics.prod_mart.cli_daily_monitoring_reporting
 GROUP BY 1;
 ```

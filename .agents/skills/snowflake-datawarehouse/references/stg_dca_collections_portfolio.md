@@ -1,5 +1,3 @@
-# Skill: `prod_source.stg_dca_collections_portfolio`
-
 ## Overview
 
 `PROD_ANALYTICS.PROD_SOURCE.STG_DCA_COLLECTIONS_PORTFOLIO` is a **monthly incremental snapshot** of all accounts eligible for — or currently under — referral to a Debt Collection Agency (DCA). It is the single source of truth for monthly DCA referral decisions across all Australian Zip products.
@@ -10,11 +8,8 @@ On the **3rd of each month**, this model runs against the end-of-prior-month acc
 3. Randomly assigns eligible accounts to a collector (ARMA, Indebted, or In-house) using product-specific splits
 4. Outputs one row per account per collector per month — the file that Credit Ops uploads directly to each DCA
 
-- **dbt model:** [`models/source/dca/stg_dca_collections_portfolio.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/source/dca/stg_dca_collections_portfolio.sql)
-- **Schema.yml:** [`models/source/dca/stg_dca_collections_portfolio.yml`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/source/dca/stg_dca_collections_portfolio.yml)
 - **Materialization:** Incremental (partitioned by `month`)
 - **Unique key:** `(account_id, collector_id, month)`
-- **Tags:** `dca_referral`, `dca_referral_monthly`
 - **Row grain:** One row per account × collector × month
 - **Expected row count:** 12,000–16,000 rows per current month
 
@@ -123,60 +118,9 @@ New referrals are randomly allocated to collectors using `UNIFORM()`. Previous r
 
 ---
 
-## Data Lineage
-
-### Upstream Sources (20+ refs)
-
-```
-stg_zmdb_account                              ─┐
-stg_zmdb_consumer                             ─┤
-stg_zmdb_consumer_account                     ─┤
-stg_zmdb_consumer_name                        ─┤
-stg_zmdb_consumer_address / stg_zmdb_address  ─┤
-stg_zmdb_consumer_phone / stg_zmdb_phone      ─┤
-stg_zmdb_consumer_attribute / stg_zmdb_attribute ─┤
-stg_batchoperations_account_daily_summary     ─┤──► stg_dca_collections_portfolio
-stg_zmpaydb_payments / stg_zmpaydb_payment_status ─┤
-stg_zmpaydb_payment_methods / _method_status  ─┤
-stg_arma_all_accounts_referred                ─┤
-stg_indebted_all_accounts_referred            ─┤
-stg_arma_closure                              ─┤
-stg_indebted_closed_accounts                  ─┤
-stg_indebted_external_accounts                ─┤
-stg_dca_adhoc_referral_exclusion              ─┤
-risk_dca_stat_barred_account                  ─┤
-stg_databricks_ds_zp_late_stage_dca_referral_scoring ─┘
-```
-
-### Downstream Consumers
-
-| Model | Description | Output |
-|---|---|---|
-| `dca_zp_arma` | ZipPay accounts for ARMA | S3 CSV: `zp/ARMA/Account_file_ARMA_zp.csv` |
-| `dca_zp_indebted` | ZipPay accounts for Indebted | S3 CSV: `zp/Indebted/Account_file_indebted_zp.csv` |
-| `dca_zm_arma` | ZipMoney accounts for ARMA | S3 CSV: `zm/ARMA/Account_file_ARMA_zm.csv` |
-| `dca_zm_indebted` | ZipMoney accounts for Indebted | S3 CSV: `zm/Indebted/Account_file_indebted_zm.csv` |
-| `dca_zplus_arma` | ZipPlus accounts for ARMA | S3 CSV |
-| `dca_zplus_indebted` | ZipPlus accounts for Indebted | S3 CSV |
-| `dca_zpploan_arma` | ZipPLoan accounts for ARMA | S3 CSV |
-| `dca_zpploan_indebted` | ZipPLoan accounts for Indebted | S3 CSV |
-| `dca_daily_arma` | Daily payment + early_stage flag for ARMA | S3 CSV (daily) |
-| `dca_daily_indebted` | Daily payment + early_stage flag for Indebted | S3 CSV (daily) |
-| `dca_daily_account_status_arma` | Daily account balance/status for ARMA | S3 CSV (daily) |
-| `dca_daily_account_status_indebted` | Daily account balance/status for Indebted | S3 CSV (daily) |
-| `dca_referred_collections_accounts` | Arrears analytics — tracks account progression post-referral | Tableau dashboard |
-| `risk_zm_dca_reporting` | ZipMoney DCA recovery tracking | Tableau |
-| `risk_zippay_dca_reporting` | ZipPay DCA recovery tracking | Tableau |
-| `risk_zipplus_dca_reporting` | ZipPlus DCA recovery tracking | Tableau |
-
----
-
 ## Example Queries
 
 ### 1. All accounts referred to ARMA in the most recent month
-
-From [`dca_zp_arma.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/rmds_migration/dca/dca_zp_arma.sql):
-
 ```sql
 SELECT
     account_id          AS account_ref,
@@ -198,9 +142,6 @@ WHERE month = DATE_TRUNC('month', CURRENT_DATE) - 1
 ```
 
 ### 2. All accounts referred to Indebted for ZipMoney in the most recent month
-
-From [`dca_zm_indebted.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/rmds_migration/dca/dca_zm_indebted.sql):
-
 ```sql
 SELECT
     account_id          AS account_ref,
@@ -222,9 +163,6 @@ WHERE month = DATE_TRUNC('month', CURRENT_DATE) - 1
 ```
 
 ### 3. Early-stage referrals across all collectors (used in daily payment files)
-
-From [`dca_daily_arma.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/rmds_migration/dca/dca_daily_arma.sql):
-
 ```sql
 SELECT
     account_id,
@@ -241,9 +179,6 @@ QUALIFY ROW_NUMBER() OVER (
 ```
 
 ### 4. DCA referral events for arrears analytics
-
-From [`dca_referred_collections_accounts.sql`](https://gitlab.com/zip-au/product-analytics/dbt-cloud/-/blob/main/models/mart/arrears/dca_referred_collections_accounts.sql):
-
 ```sql
 SELECT
     account_id,
@@ -262,7 +197,6 @@ FROM PROD_ANALYTICS.PROD_SOURCE.STG_DCA_COLLECTIONS_PORTFOLIO
 ```
 
 ### 5. Monthly referral volume by product and collector
-
 ```sql
 SELECT
     DATE_TRUNC('month', month)               AS referral_month,
