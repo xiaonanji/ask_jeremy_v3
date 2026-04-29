@@ -360,7 +360,7 @@ class LocalToolRegistry:
         def load_skill_reference(
             file_path: str,
         ) -> str:
-            """Load the content of a skill reference file given its absolute path. Use this to read detailed documentation, schema descriptions, or other reference materials mentioned in activated skill instructions. The file must be located within a recognised skill directory."""
+            """Load a reference file bundled inside a .agents/skills/ directory. Only use this for files that live within the skill directories themselves (e.g. schema docs shipped alongside a SKILL.md). Do NOT use this to read external files such as wiki pages, project files, or repositories — use run_shell_command for those instead."""
             target = Path(file_path).resolve()
 
             allowed_roots = [

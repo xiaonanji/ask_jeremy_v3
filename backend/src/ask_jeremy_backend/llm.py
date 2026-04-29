@@ -32,6 +32,8 @@ from .skills.prompting import SkillPromptRenderer
 from .mcp_tools import emit_custom_event, set_mcp_event_emitter
 from .tools import LocalToolRegistry
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SessionContext:
@@ -109,6 +111,7 @@ class LangGraphChatClient:
         session: SessionContext,
         history: list[ChatMessage],
     ) -> GeneratedReply:
+        self._repair_interrupted_state(session.session_id)
         result = self._graph.invoke(
             {"messages": self._to_langchain_messages(history)},
             {"configurable": {"thread_id": session.session_id}},
@@ -126,6 +129,77 @@ class LangGraphChatClient:
 
     def close(self) -> None:
         self._checkpoint_connection.close()
+
+    def _repair_interrupted_state(
+        self, session_id: str, *, graph=None
+    ) -> None:
+        """Fix checkpoint state left invalid by a mid-tool-call interruption.
+
+        When a stream is cancelled after the model has issued tool_calls but
+        before tool results are recorded, the checkpoint ends with an AIMessage
+        containing tool_calls and no matching ToolMessages.  This violates the
+        API's message format requirements.  We detect this and inject synthetic
+        error ToolMessages so the next turn can proceed.
+        """
+        g = graph or self._graph
+        config = {"configurable": {"thread_id": session_id}}
+        snapshot = g.get_state(config)
+        values = getattr(snapshot, "values", {}) or {}
+        messages = values.get("messages", [])
+
+        if not messages:
+            return
+
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage):
+            return
+
+        tool_calls = getattr(last_msg, "tool_calls", None) or []
+        if not tool_calls:
+            return
+
+        # Collect IDs of ToolMessages already present after the last AIMessage
+        existing_tool_ids: set[str] = set()
+        for msg in reversed(messages[:-1]):
+            if isinstance(msg, ToolMessage):
+                existing_tool_ids.add(getattr(msg, "tool_call_id", ""))
+            else:
+                break
+
+        orphaned = [
+            tc
+            for tc in tool_calls
+            if (tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", ""))
+            not in existing_tool_ids
+        ]
+
+        if not orphaned:
+            return
+
+        logger.warning(
+            "Repairing interrupted checkpoint for session %s: "
+            "injecting %d synthetic tool result(s)",
+            session_id,
+            len(orphaned),
+        )
+
+        repair_messages: list[ToolMessage] = []
+        for tc in orphaned:
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
+            tc_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+            repair_messages.append(
+                ToolMessage(
+                    content=json.dumps({
+                        "ok": False,
+                        "error_type": "interrupted",
+                        "message": "Tool execution was interrupted by the user.",
+                    }),
+                    tool_call_id=tc_id,
+                    name=tc_name,
+                )
+            )
+
+        g.update_state(config, {"messages": repair_messages})
 
     async def stream_reply(
         self,
@@ -164,6 +238,7 @@ class LangGraphChatClient:
             try:
                 checkpointer = SqliteSaver(connection)
                 stream_graph = self._build_graph(streaming=False, checkpointer=checkpointer)
+                self._repair_interrupted_state(session.session_id, graph=stream_graph)
 
                 for mode, data in stream_graph.stream(
                     {"messages": history_messages},
@@ -410,9 +485,11 @@ class LangGraphChatClient:
         selected_ids: list[str] = classification["skill_ids"]
         requires_data_pipeline: bool = classification["requires_data_pipeline"]
 
-        # Always include person-wiki-knowledge skill only for background/context questions.
+        # Always include person-wiki-knowledge skill so the agent can
+        # consult the wiki for domain context — including during data
+        # pipeline turns where definitions or terminology inform SQL.
         always_active_skills = []
-        if context.person_wiki_root and not requires_data_pipeline:
+        if context.person_wiki_root:
             wiki_skill = self.skill_catalog.get_by_name("person-wiki-knowledge")
             if wiki_skill and wiki_skill.id not in current_ids:
                 always_active_skills.append(wiki_skill.id)
@@ -511,6 +588,11 @@ class LangGraphChatClient:
                 extra_system_messages.append(msg)
             else:
                 messages.append(msg)
+
+        # Ensure tool_use / tool_result pairs are consistent before sending
+        # to the LLM.  Checkpoint merges can leave orphaned ToolMessages or
+        # AIMessages with tool_calls that lost their matching results.
+        messages = _sanitize_tool_message_pairs(messages)
 
         database_display = _database_display_name(context.database_backend)
 
@@ -629,7 +711,13 @@ class LangGraphChatClient:
     def _tools_for_turn(self, state: SkillAwareState) -> list:
         if not self._requires_data_pipeline(state):
             return self._tools
-        blocked_names = {"run_shell_command", "run_python_script"}
+        # Block run_python_script during data-pipeline turns so the agent
+        # cannot bypass the bounded analysis pipeline.  Keep
+        # run_shell_command available — the agent needs it for wiki
+        # searches, file inspection, and other context-gathering that
+        # informs SQL construction.  The system prompt already instructs
+        # the agent not to use shell commands for data retrieval.
+        blocked_names = {"run_python_script"}
         return [
             tool for tool in self._tools
             if getattr(tool, "name", "") not in blocked_names
@@ -956,7 +1044,7 @@ class LangGraphChatClient:
                 context, [msg for _, msg in to_summarize], old_summary
             )
         except Exception:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Message compaction summary failed; skipping compaction this cycle.",
                 exc_info=True,
             )
@@ -1105,6 +1193,89 @@ class LangGraphChatClient:
 
 def build_chat_client(settings: Settings) -> LangGraphChatClient:
     return LangGraphChatClient(settings)
+
+
+def _sanitize_tool_message_pairs(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Ensure every ToolMessage references a tool_call in the preceding AIMessage.
+
+    When LangGraph's ``add_messages`` reducer merges session-store messages
+    (plain ``AIMessage`` without ``tool_calls``) with checkpoint messages
+    (which include ``AIMessage`` with ``tool_calls`` and ``ToolMessage``
+    results), the merge can replace an ``AIMessage`` that *had* tool_calls
+    with one that doesn't, leaving orphaned ``ToolMessage`` objects.
+
+    The Anthropic API rejects conversations with mismatched
+    ``tool_use`` / ``tool_result`` pairs, so we strip any ``ToolMessage``
+    whose ``tool_call_id`` doesn't appear in the immediately preceding
+    ``AIMessage.tool_calls``.  We also inject synthetic error
+    ``ToolMessage`` objects when an ``AIMessage`` has ``tool_calls`` that
+    lack matching ``ToolMessage`` replies (interrupted execution).
+    """
+    sanitized: list[BaseMessage] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            sanitized.append(msg)
+            expected_ids: dict[str, str] = {}
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+                tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                expected_ids[tc_id] = tc_name
+            seen_ids: set[str] = set()
+
+            # Consume following ToolMessages that belong to this AIMessage
+            j = i + 1
+            while j < len(messages) and isinstance(messages[j], ToolMessage):
+                tm = messages[j]
+                tc_id = getattr(tm, "tool_call_id", "")
+                if tc_id in expected_ids:
+                    sanitized.append(tm)
+                    seen_ids.add(tc_id)
+                else:
+                    logger.debug(
+                        "Dropping orphaned ToolMessage for tool_call_id=%s",
+                        tc_id,
+                    )
+                j += 1
+
+            # Inject synthetic results for any tool_calls without a response
+            for missing_id, missing_name in expected_ids.items():
+                if missing_id not in seen_ids:
+                    logger.debug(
+                        "Injecting synthetic ToolMessage for tool_call_id=%s",
+                        missing_id,
+                    )
+                    sanitized.append(
+                        ToolMessage(
+                            content=json.dumps({
+                                "ok": False,
+                                "error_type": "interrupted",
+                                "message": "Tool execution was interrupted by the user.",
+                            }),
+                            tool_call_id=missing_id,
+                            name=missing_name,
+                        )
+                    )
+
+            i = j  # skip past the consumed ToolMessages
+            continue
+
+        if isinstance(msg, ToolMessage):
+            # Orphaned ToolMessage not preceded by an AIMessage with tool_calls
+            logger.debug(
+                "Dropping orphaned ToolMessage (no preceding tool_calls) "
+                "for tool_call_id=%s",
+                getattr(msg, "tool_call_id", ""),
+            )
+            i += 1
+            continue
+
+        sanitized.append(msg)
+        i += 1
+
+    return sanitized
 
 
 def _database_display_name(backend: DatabaseBackend) -> str:

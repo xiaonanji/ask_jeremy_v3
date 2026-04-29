@@ -80,6 +80,18 @@ Note that for each table below, there is a reference markdown file that provides
 - Best for: Analyzing external collection agency's (DCA) collections performance and tracking delinquent accounts.
 - Reference: `references/stg_dca_collections_portfolio.md`
 
+### fct_order
+- Full name: `prod_analytics.prod_prep.fct_order`
+- Description: This is the **primary fact table for purchase/order analysis** at Zip. Each row represents a single customer order (one transaction at one merchant), covering all Zip products and all checkout channels — online, in-store, VCN (virtual card), gift cards, bill payments, and Tap & Zip.
+- Best for: Analyzing purchase/order patterns and customer behavior.
+- Reference: `references/fct_order.md`
+
+### stg_zmdb_consumer_attribute_history
+- Full name: `prod_analytics.prod_source.stg_zmdb_consumer_attribute_history`
+- Description: This is an **SCD Type 2 (Slowly Changing Dimension)** staging table that tracks the full historical record of attributes assigned to consumers in the ZipMoney platform (ZMDB). It is built from the source `zm_consumerattribute` table via Airbyte CDC, and is refreshed **hourly**.
+- Best for: Use this table when you need **point-in-time** or **historical** attribute analysis. For current-state-only queries, prefer the non-history sibling: `prod_source.stg_zmdb_consumer_attribute` (a view that wraps this table, filtering for active records only).
+- Reference: `references/stg_zmdb_consumer_attribute_history.md`
+
 ---
 
 ## Gocha

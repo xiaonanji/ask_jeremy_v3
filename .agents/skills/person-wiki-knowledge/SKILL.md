@@ -47,11 +47,13 @@ In all commands below, substitute the resolved repo root for `<PERSON_WIKI_ROOT>
 
 When the user asks a question that should be answered from this wiki:
 
-1. Read `<PERSON_WIKI_ROOT>\wiki\index.md` first.
-2. If the wiki branch is obvious and small, open the relevant `wiki/` pages directly.
-3. If retrieval is unclear or the question is broad, use qmd-backed search first.
+1. Read `<PERSON_WIKI_ROOT>\wiki\index.md` first using `run_shell_command`.
+2. If the wiki branch is obvious and small, read the relevant `wiki/` pages directly using `run_shell_command` (e.g. `type <path>`).
+3. If retrieval is unclear or the question is broad, use qmd-backed search first via `run_shell_command`.
 4. Read the most relevant wiki pages, not the raw inbox, unless the user explicitly wants raw-source inspection.
 5. Answer with references to wiki pages when possible.
+
+**Important**: Wiki files live outside the skill directory. Use `run_shell_command` to read them — do NOT use `load_skill_reference` (that tool is only for files inside `.agents/skills/`).
 
 Prefer these commands:
 
@@ -64,6 +66,12 @@ Fallback:
 
 ```bash
 python <PERSON_WIKI_ROOT>\scripts\wiki.py search "keywords"
+```
+
+To read a specific wiki page:
+
+```bash
+type <PERSON_WIKI_ROOT>\wiki\sources\<page>.md
 ```
 
 Useful support commands:
