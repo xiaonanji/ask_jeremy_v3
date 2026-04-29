@@ -9,6 +9,7 @@
     "name": "mem0",
     "url": "https://mem0.seanji.net/mcp",
     "bearer_token": "${MEM0_MCP_TOKEN}",
+    "user_id": "seanji",
     "enabled": true
   }
 ]

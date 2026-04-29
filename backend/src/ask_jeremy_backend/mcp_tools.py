@@ -7,6 +7,7 @@ MCP servers are configured in backend/mcp.json:
         "name":         "my-server",
         "url":          "http://192.168.1.100/mcp",
         "bearer_token": "${MY_SECRET_TOKEN}",
+        "user_id":      "seanji",
         "enabled":      true
       }
     ]
@@ -40,6 +41,7 @@ class McpServerConfig:
     name: str
     url: str
     bearer_token: str = ""
+    user_id: str = ""
     enabled: bool = True
 
 
@@ -70,9 +72,16 @@ def load_mcp_configs(config_path: Path) -> list[McpServerConfig]:
             name=str(name),
             url=str(url),
             bearer_token=os.path.expandvars(str(item.get("bearer_token", ""))),
+            user_id=_expanded_str(item.get("user_id", "")),
             enabled=bool(item.get("enabled", True)),
         ))
     return [c for c in configs if c.enabled]
+
+
+def _expanded_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return os.path.expandvars(str(value)).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +127,15 @@ class McpToolProxy(BaseTool):
 
     _inner: BaseTool = pydantic.PrivateAttr()
     _server_name: str = pydantic.PrivateAttr()
+    _user_id: str | None = pydantic.PrivateAttr(default=None)
 
-    def __init__(self, *, inner: BaseTool, server_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        inner: BaseTool,
+        server_name: str,
+        user_id: str = "",
+    ) -> None:
         init_kwargs: dict[str, Any] = {
             "name": inner.name,
             "description": inner.description or f"Tool provided by MCP server '{server_name}'",
@@ -129,9 +145,11 @@ class McpToolProxy(BaseTool):
         super().__init__(**init_kwargs)
         self._inner = inner
         self._server_name = server_name
+        self._user_id = user_id if _tool_accepts_user_id(inner) else None
 
     def _run(self, *args: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
         _emit_mcp_event(self._server_name, self.name)
+        args, kwargs = _with_configured_user_id(args, kwargs, self._user_id)
         # MCP tools from langchain-mcp-adapters are async-only.  The LangGraph
         # ToolNode invokes tools synchronously from a worker thread (no running
         # event loop), so we bridge to the async implementation here.
@@ -139,7 +157,35 @@ class McpToolProxy(BaseTool):
 
     async def _arun(self, *args: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
         _emit_mcp_event(self._server_name, self.name)
+        args, kwargs = _with_configured_user_id(args, kwargs, self._user_id)
         return await self._inner._arun(*args, config=config, **kwargs)
+
+
+def _tool_accepts_user_id(tool: BaseTool) -> bool:
+    args_schema = tool.args_schema
+    if args_schema is None:
+        return False
+    if isinstance(args_schema, dict):
+        properties = args_schema.get("properties")
+        return isinstance(properties, dict) and "user_id" in properties
+    fields = getattr(args_schema, "model_fields", None) or getattr(args_schema, "__fields__", None)
+    return isinstance(fields, dict) and "user_id" in fields
+
+
+def _with_configured_user_id(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    user_id: str | None,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    if user_id is None:
+        return args, kwargs
+    if args and isinstance(args[0], dict):
+        updated_first_arg = dict(args[0])
+        updated_first_arg["user_id"] = user_id
+        return (updated_first_arg, *args[1:]), kwargs
+    updated_kwargs = dict(kwargs)
+    updated_kwargs["user_id"] = user_id
+    return args, updated_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +249,13 @@ async def connect_mcp_servers(
             )
             server_tools = await client.get_tools(server_name=cfg.name)
             for tool in server_tools:
-                tools.append(McpToolProxy(inner=tool, server_name=cfg.name))
+                tools.append(
+                    McpToolProxy(
+                        inner=tool,
+                        server_name=cfg.name,
+                        user_id=cfg.user_id,
+                    )
+                )
         except Exception as exc:
             import traceback
             warnings.warn(
